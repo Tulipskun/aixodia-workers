@@ -15,16 +15,6 @@
  *   auth_tokens   one row per live token, hashed. No expiry column on purpose:
  *                 a token dies only when revoked (the draft's rule).
  *   rate_limits   fixed-window counters for the public poll endpoint.
- *
- * The plaintext token exists in exactly two places: the mint response and the
- * app's memory. D1 holds only the hash, and the engine is pushed hashes too, so
- * no database or engine dump yields a working credential.
- *
- * Minting happens on the first poll rather than at approve time for that
- * reason: the approve page runs in a browser that must never see the token, and
- * storing the plaintext for the app to collect later would defeat the hashing.
- * The draft's "ได้ access_token ครั้งเดียว" is literal — a lost response means
- * starting the sign-in over.
  */
 
 import { json, base64url, sha256Hex, now, hooks, allowlist, permits, syncSecret } from './shared.js'
@@ -105,17 +95,12 @@ async function rateLimit(env, key, limit) {
 export async function deviceCode(env, req) {
   const deviceCode = randomSecret()
   const deviceCodeHash = await sha256Hex(deviceCode)
-  // The app sends the phone model; the user agent is only a fallback, because
-  // "curl/8.14.1" on an approval page tells the approver nothing about which
-  // device is asking.
   const named = await req
     .clone()
     .json()
     .then((payload) => String(payload?.device_name || '').trim())
     .catch(() => '')
 
-  // The user code must be unique among live codes: a collision would let one
-  // person approve someone else's pending sign-in.
   for (let attempt = 0; attempt < USER_CODE_TRIES; attempt++) {
     const userCode = randomUserCode()
     try {
@@ -150,10 +135,6 @@ function verificationUrl(env) {
 
 /**
  * `GET /auth/device?code=...` — the approve page.
- *
- * Access protects this at the edge when reached through the console origin, but
- * the Worker also sits on a bare workers.dev hostname where nothing protects it,
- * so the handler re-checks the assertion itself.
  */
 export async function devicePage(env, req, url) {
   const who = await accessWho(env, req)
@@ -249,9 +230,6 @@ export async function deviceToken(env, req) {
   if (row.state === 'pending') return json({ status: 'pending', interval: POLL_INTERVAL })
   if (row.state !== 'approved') return json({ status: 'expired' }, 410)
 
-  // Already minted on an earlier poll: the draft's single delivery. A lost
-  // response means the sign-in starts over; re-sending would require storing
-  // the plaintext, which is exactly what the hashing rule forbids.
   if (row.token_hash) {
     const tokenRow = await env.DB.prepare(
       `SELECT state FROM auth_tokens WHERE token_hash = ?1`,
@@ -259,7 +237,6 @@ export async function deviceToken(env, req) {
     return json({ status: tokenRow?.state === 'active' ? 'delivered' : 'revoked' }, tokenRow?.state === 'active' ? 200 : 401)
   }
 
-  // First poll after approve: mint, register, push, deliver — once.
   const token = randomSecret()
   const tokenHash = await sha256Hex(token)
   await env.DB.prepare(
@@ -267,8 +244,6 @@ export async function deviceToken(env, req) {
      VALUES (?1, (SELECT approved_by FROM device_codes WHERE device_code_hash = ?2), ?3, 'active', ?4, 'pending', NULL)`,
   ).bind(tokenHash, hash, row.device_name || deviceName(req), now()).run()
 
-  // The conditional update is the single-delivery lock: a concurrent poll loses
-  // this race and falls into the `delivered` branch above.
   const claimed = await env.DB.prepare(
     `UPDATE device_codes SET token_hash = ?2 WHERE device_code_hash = ?1 AND token_hash IS NULL`,
   ).bind(hash, tokenHash).run()
@@ -276,8 +251,6 @@ export async function deviceToken(env, req) {
     return json({ status: 'delivered' })
   }
 
-  // Best-effort push. If the engine is down the row stays `pending` and the
-  // engine's periodic re-sync picks it up — the person is not blocked.
   await pushSync(env, { activate: [tokenHash] })
   return json({ status: 'ok', access_token: token, token_type: 'Bearer' })
 }
@@ -351,27 +324,76 @@ export async function activeSessions(env, req) {
   return json({ hashes: (rows.results || []).map((r) => r.token_hash) })
 }
 
-// ---------------------------------------------------------------- engine push
+// ---------------------------------------------------------------- multi-engine push
+
+export async function resolveEngineTargets(env) {
+  const urls = new Set()
+  const addRaw = (raw) => {
+    if (!raw) return
+    const trimmed = String(raw).trim()
+    if (!trimmed) return
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed)
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const u = typeof item === 'string' ? item : item?.url
+            if (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) {
+              urls.add(u.trim().replace(/\/+$/, ''))
+            }
+          }
+        }
+      } catch {
+        /* ignore malformed JSON */
+      }
+      return
+    }
+    for (const part of trimmed.split(',')) {
+      const token = part.trim()
+      if (!token) continue
+      const eq = token.indexOf('=')
+      const candidate = (eq > 0 ? token.slice(eq + 1) : token).trim().replace(/\/+$/, '')
+      if (/^https?:\/\//i.test(candidate)) urls.add(candidate)
+    }
+  }
+
+  addRaw(env.ENGINE_URLS)
+  addRaw(env.ENGINES_JSON)
+  if (env.CONFIG && typeof env.CONFIG.get === 'function') {
+    try {
+      addRaw(await env.CONFIG.get('engines'))
+    } catch {
+      /* ignore KV read failure */
+    }
+  }
+  addRaw(env.ENGINE_URL)
+  return Array.from(urls)
+}
 
 async function pushSync(env, body) {
-  const target = env.ENGINE_URL
-  if (!target) return
+  const targets = await resolveEngineTargets(env)
+  if (targets.length === 0) return
   const secret = await syncSecret(env)
   if (!secret) throw new Error('required Workers KV key auth/sync_secret is missing')
-  try {
-    const res = await fetch(`${target.replace(/\/$/, '')}/auth/sessions/sync`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-auth-sync': secret },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000),
-    })
-    if (res.ok && body.activate) {
-      await env.DB.prepare(
-        `UPDATE auth_tokens SET sync_state = 'synced' WHERE token_hash IN (${body.activate.map(() => '?').join(',')})`,
-      ).bind(...body.activate).run()
-    }
-  } catch {
-    // Staying `pending` is the contract: the engine's re-sync will collect it.
+
+  const outcomes = await Promise.allSettled(
+    targets.map((target) =>
+      fetch(`${target}/auth/sessions/sync`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-auth-sync': secret },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5000),
+      }),
+    ),
+  )
+
+  // Only mark synced when every configured engine confirmed receipt; otherwise
+  // stay `pending` so temporarily offline engines collect active hashes on boot.
+  const allSynced = outcomes.every((r) => r.status === 'fulfilled' && r.value.ok)
+  if (allSynced && body.activate) {
+    await env.DB.prepare(
+      `UPDATE auth_tokens SET sync_state = 'synced' WHERE token_hash IN (${body.activate.map(() => '?').join(',')})`,
+    ).bind(...body.activate).run()
   }
 }
 
@@ -383,8 +405,6 @@ async function syncSecretOk(env, req) {
 // ---------------------------------------------------------------- helpers
 
 async function accessWho(env, req) {
-  // The hook is published by index.js at import time; the lazy import is the
-  // fallback for a direct import of this module (tests, tooling).
   const resolve = hooks.accessIdentity || (await import('./index.js')).accessIdentity
   const found = await resolve(env, req)
   return { email: found.email ? found.email.toLowerCase() : '', error: found.error }
