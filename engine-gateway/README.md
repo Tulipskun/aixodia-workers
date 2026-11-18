@@ -1,41 +1,45 @@
 # AIxodia engine gateway
 
-Answers "which engines are there" at the address the engine already has:
+Answers one question no single engine can answer: which engines are there.
 
 ```
 https://engine.aixodia.dpdns.org/api/engines   →   {"engines": [...]}
 ```
 
-and, once there is more than one machine, gives every engine its own path on
-**one** public hostname:
+Everything else on that hostname belongs to the engine behind it.
+
+## Each engine has its own name, on its own tunnel
+
+An engine is addressed as
 
 ```
-https://<gateway host>/<machine>/api/...   →   https://<machine>.aixodia.dpdns.org/api/...
+https://<its tunnel host>/<name>/…       e.g. https://engine.aixodia.dpdns.org/m-8a7d1192/api/sessions
 ```
 
-The proxy half is deployed but unrouted while the deployment has one engine: one
-engine already has one address, and `/api/engines` rides the Access bypass that
-`/api/*` already has. Giving the proxy a hostname later is one route plus one D1
-row, not new code.
+which is the same shape droidime gives its devices (`mcp…/<device>/…`). The
+engine does two things itself, on startup:
 
-`<machine>` is the name the engine gives itself: `m-` plus eight hex digits of
-its `/etc/machine-id`, or whatever `AIXODIA_INSTANCE` overrides it with. It is
-printed at startup (`machine m-…`) and returned by `/healthz` as `instance`.
+* **claims a name** in the `engines` table — the desired name (`m-` plus eight
+  hex digits of `/etc/machine-id`, or `AIXODIA_INSTANCE`), or `<name>-1`,
+  `<name>-2`, … if that one is taken;
+* **serves its name** — every route it has is also reachable under that prefix,
+  so `/m-8a7d1192/healthz` is `/healthz`.
 
-The Worker reads the first path segment, looks it up in the **`engines` table in
-D1**, removes the segment, and forwards the request to that instance's own Named
-Tunnel origin with the Cloudflare Access service token attached. The engine
-therefore keeps serving the paths it always served (`/api/...`, `/ws`,
-`/healthz`) and needs no knowledge of the shared address.
+The row is found again by `origin_host`, the tunnel hostname the engine answers
+on, never by the name. A restart therefore never allocates a second name, and a
+machine renamed in place keeps the row it already owns.
+
+So a Worker no longer forwards anything: one engine's address is its own tunnel,
+and a second engine has its own. What is left here is the list.
 
 ## The registry is one table
 
 ```sql
 CREATE TABLE engines (
-  id          TEXT PRIMARY KEY,      -- the machine name
+  id          TEXT PRIMARY KEY,      -- the name in the path
   name        TEXT NOT NULL,         -- what a person sees in the switcher
   url         TEXT NOT NULL,         -- public base URL a client should call
-  origin_host TEXT,                  -- <machine>.aixodia.dpdns.org
+  origin_host TEXT,                  -- the tunnel hostname that engine answers on
   subtitle    TEXT,
   tag         TEXT,
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -45,43 +49,32 @@ CREATE TABLE engines (
 
 `schema.sql` in the repository root creates it and is idempotent.
 
-* `GET /api/engines` (and `GET /engines` on whatever host the route names)
-  answers the registry — id, name, url, subtitle, tag, never the tunnel hostname
-  — so the console's engine switcher has one source of truth.
-* Every proxied request reads `origin_host` from the same row.
+* `GET /api/engines` answers the registry — id, name, url, subtitle, tag, never
+  the tunnel hostname — so the console's engine switcher has one source of truth.
 * The sign-in Worker reads the same `url` column when it pushes a revocation to
-  every engine, so a new engine is one `INSERT` for all three consumers.
+  every engine, so a new engine is one row for every consumer.
+* Nothing else is read here. The engine writes its own row; this Worker only
+  lists.
 
-Adding a machine is a row, not a deploy (its `url` is the address clients call —
-`https://engine.aixodia.dpdns.org` while there is only one):
+## Why a registry instead of Workers KV
 
-```bash
-npx wrangler d1 execute aixodia --remote --command \
-  "INSERT INTO engines (id, name, url, origin_host) VALUES
-     ('m-abc12345', 'Work phone', 'https://m-abc12345.aixodia.dpdns.org', 'm-abc12345.aixodia.dpdns.org')"
-```
-
-## Why a gateway instead of one hostname per engine
-
-A tunnel per engine is still needed — each engine is a separate machine or a
-separate process with its own credentials — but a client should not have to learn
-a new hostname per engine, and a DNS record per engine is one more thing to
-provision and protect. One hostname, one Access policy, one certificate, and a
-path segment that names the instance.
+The console used to read a KV key `engines` that nothing ever wrote, so it saw one
+engine, and revocation had no target. The table is written by the engines that
+exist, which makes it the only place that can be wrong.
 
 ## Cloudflare resources
 
 - Zone `aixodia.dpdns.org` on the account.
-- Worker route `engine.aixodia.dpdns.org/api/engines*` (add a gateway hostname
-  route when a second machine exists).
+- Worker route `engine.aixodia.dpdns.org/api/engines*`.
 - D1 database `aixodia` bound as `DB`, holding the `engines` table.
-- The engine hostname's Access application must bypass `/api/*`, which it does
-  for the engine's own API anyway.
-- Access application protecting `*.aixodia.dpdns.org/*` with a service-token
-  policy, and that token stored as the `ACCESS_CLIENT_ID` /
-  `ACCESS_CLIENT_SECRET` secrets.
+- The engine hostname's Access application must bypass `/api/*` and `/healthz`,
+  which it does for the engine's own API anyway. A named path needs the same
+  bypass under the name: `engine.aixodia.dpdns.org/<name>/api` and
+  `engine.aixodia.dpdns.org/<name>/healthz` (one application each, no policy but
+  `bypass`) — that is what lets the console call an engine through its name.
 
-The Worker fails closed: no origin credential, no answer.
+There is no service token here any more: nothing is forwarded, so nothing has to
+authenticate to an origin.
 
 ## Deploy
 
@@ -90,41 +83,21 @@ npx wrangler d1 execute aixodia --remote --file=../schema.sql
 npx wrangler deploy
 ```
 
-The Worker needs a service token to reach an Access-protected origin. Its secret
-is shown once, when it is created, so keep a copy where the next session can find
-it: the `system_state` table in D1 holds `gateway/access_client_id` and
-`gateway/access_client_secret` for this Worker. Nothing auth-related is written
-there, and this Worker reads nothing from the auth Worker's namespace.
+## Provisioning a second machine
 
-```bash
-curl -s -X POST -H "Authorization: Bearer $CF_TOKEN" -H 'content-type: application/json' \
-  -d '{"name":"aixodia-engine-gateway","duration":"87600h"}' \
-  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/access/service_tokens"
-# client_id and client_secret above -> system_state, then:
-printf '%s' "$CLIENT_ID"     | npx wrangler secret put ACCESS_CLIENT_ID
-printf '%s' "$CLIENT_SECRET" | npx wrangler secret put ACCESS_CLIENT_SECRET
-```
-
-The token also has to be allowed by the origin's Access application: add a
-`non_identity` policy whose include is `service_token.token_id` = that token.
-
-## Provisioning a machine
-
-`<machine>` below is the engine's own name: `aixodia status` (or the log line
-`machine m-…`) prints it after the engine has started once, and `/healthz`
-returns it as `instance`. Nothing on the machine needs configuring.
-
-1. Create a remotely-managed Named Tunnel for the machine.
-2. Point its public hostname `<machine>.aixodia.dpdns.org` at
+1. Create a remotely-managed Named Tunnel for it.
+2. Point its public hostname, e.g. `work.aixodia.dpdns.org`, at
    `http://localhost:8787` — the engine's port is the same on every machine.
-   A machine that already runs a tunnel only needs one more ingress rule and a
-   proxied CNAME to the tunnel's `…cfargotunnel.com` target.
-3. Protect that hostname with the Access service-token policy.
-4. `INSERT` the row above.
-5. Write the engine's own two keys in Workers KV `AIXODIA_CONFIG`:
+3. Protect that hostname with the Access application and its policies.
+4. Write its own two keys in Workers KV `AIXODIA_CONFIG`:
    `instances/<machine>/tunnel_token` (the tunnel connector token) and
-   `instances/<machine>/tunnel_url` (`https://<machine>.aixodia.dpdns.org`).
-6. `aixodia start` — `CF_TOKEN` is the only variable it needs.
+   `instances/<machine>/tunnel_url` (`https://work.aixodia.dpdns.org`).
+5. `aixodia start` — `CF_TOKEN` is the only variable it needs. The engine inserts
+   its own row (and prints the name it got: `public name …`).
+
+Steps 1–3 are the provisioning; no `INSERT` and no deploy. Adding the named
+Access bypasses for that engine's name is the only registry-side work, and only
+the console needs it.
 
 The engine publishes its live address to `instances/<machine>/daemon/url` and its
 version to `instances/<machine>/daemon/version`.

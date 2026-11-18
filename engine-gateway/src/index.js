@@ -1,35 +1,14 @@
-//! Public address of every engine instance: one hostname, one path segment per
-//! engine.
+//! The engine registry, as one endpoint: `GET /api/engines`.
 //!
-//! Request /<instance>/api/...  →  https://<instance>.<origin suffix>/api/...
+//! Each engine is reachable at `https://<its tunnel host>/<name>/…` — the shape
+//! droidime uses for devices — and the engine itself claims that name in the
+//! `engines` table and serves the path. So this Worker no longer forwards
+//! anything: one engine's address is its own tunnel, and a second one has its
+//! own. What is left for a Worker is the answer no single engine can give, the
+//! list of engines that exist.
 //!
-//! The first path segment names the instance; the `engines` table in D1 holds
-//! that instance's own origin hostname. The segment is removed before the
-//! request is forwarded, so every engine keeps serving the paths it has always
-//! served (/api/..., /ws, /healthz) and nothing in the engine or the phone has
-//! to know it arrived through a shared address.
-//!
-//! `GET /engines` answers the registry itself, so the console learns which
-//! engines exist from the same table this Worker routes by instead of keeping a
-//! second copy in Workers KV.
-
-// The same shape the engine enforces (aixodia_state::valid_instance_name):
-// 32 characters at most, alnum at both ends, single hyphens between.
-const INSTANCE_NAME = /^[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,31}$/;
-const ORIGIN_HOST = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\.aixodia\.dpdns\.org$/;
-
-/// Headers a proxy must not forward in either direction.
-const HOP_BY_HOP = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "host"
-]);
+//! The list is read straight from D1, the same table the console used to be told
+//! about through a Workers KV key nobody ever wrote.
 
 function error(status, message) {
   return new Response(JSON.stringify({ error: message }), {
@@ -38,82 +17,26 @@ function error(status, message) {
   });
 }
 
-function list(engines) {
-  return new Response(JSON.stringify({ engines }), {
-    status: 200,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
-  });
-}
-
 export default {
   async fetch(request, env) {
+    if (!env.DB) return error(503, "The engine registry is not configured");
+
     const url = new URL(request.url);
     const segments = url.pathname.split("/").filter(Boolean);
-    if (!env.DB) return error(503, "Gateway is not configured");
-
-    // The registry itself, for the console's engine switcher. It answers on the
-    // gateway's own hostname and, while there is one engine, under the engine's
-    // `/api/` prefix — the path every client already has an Access bypass for.
-    const registryPath =
+    const isRegistry =
       (segments.length === 1 && segments[0] === "engines") ||
       (segments.length === 2 && segments[0] === "api" && segments[1] === "engines");
-    if (registryPath) {
-      if (request.method !== "GET" && request.method !== "HEAD") {
-        return error(405, "The registry is read-only here");
-      }
-      const { results } = await env.DB.prepare(
-        "SELECT id, name, url, subtitle, tag FROM engines ORDER BY created_at, id"
-      ).all();
-      return list(results || []);
+    if (!isRegistry) return error(404, "Not found");
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return error(405, "The registry is read-only");
     }
 
-    const instance = segments[0] || "";
-    if (!INSTANCE_NAME.test(instance)) return error(404, "Unknown instance");
-    const row = await env.DB.prepare("SELECT origin_host FROM engines WHERE id = ?1")
-      .bind(instance)
-      .first();
-    const origin = row ? row.origin_host : null;
-    if (!origin || !ORIGIN_HOST.test(origin)) return error(404, "Unknown instance");
-    if (!env.ACCESS_CLIENT_ID || !env.ACCESS_CLIENT_SECRET) {
-      return error(503, "Origin authentication is not configured");
-    }
-
-    const headers = new Headers(request.headers);
-    for (const name of HOP_BY_HOP) headers.delete(name);
-    headers.set("CF-Access-Client-Id", env.ACCESS_CLIENT_ID);
-    headers.set("CF-Access-Client-Secret", env.ACCESS_CLIENT_SECRET);
-    headers.set("X-Forwarded-Host", url.host);
-    headers.set("X-Forwarded-Proto", "https");
-    headers.set("X-Aixodia-Instance", instance);
-
-    // The instance segment is this gateway's, not the engine's: the engine sees
-    // the path it serves. "/" for a bare instance address.
-    const forwarded = "/" + segments.slice(1).join("/");
-    const target = new URL(forwarded + url.search, "https://" + origin);
-
-    const upstream = new Request(target, {
-      method: request.method,
-      headers,
-      body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer(),
-      redirect: "manual"
+    const { results } = await env.DB.prepare(
+      "SELECT id, name, url, subtitle, tag FROM engines ORDER BY created_at, id"
+    ).all();
+    return new Response(JSON.stringify({ engines: results || [] }), {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
     });
-
-    try {
-      const response = await fetch(upstream);
-      const responseHeaders = new Headers(response.headers);
-      for (const name of HOP_BY_HOP) responseHeaders.delete(name);
-      // Every engine answer is per-instance live state; nothing here may be cached.
-      responseHeaders.set("cache-control", "no-store");
-      // A WebSocket upgrade cannot be proxied by a Worker; say so plainly rather
-      // than letting the client see a truncated 101.
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders
-      });
-    } catch {
-      return error(502, "Instance tunnel is unavailable");
-    }
   }
 };
-export { INSTANCE_NAME, ORIGIN_HOST };

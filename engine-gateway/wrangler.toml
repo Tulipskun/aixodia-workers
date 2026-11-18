@@ -2,18 +2,16 @@ name = "aixodia-engine-gateway"
 main = "src/index.js"
 compatibility_date = "2026-11-07"
 
-# The engine registry: id, name, url, origin_host. One table, read on every
-# proxied request, written when an engine is added. The same rows answer
-# `GET /engines` for the console's engine switcher.
+# The engine registry: id, name, url, origin_host. One table, written by each
+# engine when it starts, read here for the console's engine switcher.
 [[d1_databases]]
 binding = "DB"
 database_name = "aixodia"
 database_id = "e8e746ea-691e-43bf-9fe2-c4e4016f29a1"
 
-# One engine needs one address, and it already has one: the registry answers under
-# the engine's own `/api/` prefix, which its Access bypass already covers. The
-# `<machine>/...` proxy stays in the code for the day a second machine exists;
-# giving it a hostname is then one route and one KV-free D1 row, not new code.
+# Each engine is addressed at its own tunnel host under its own name
+# (`https://<engine host>/<name>/…`), so no path on this hostname is forwarded
+# any more: only the list of engines is answered here.
 [[routes]]
 pattern = "engine.aixodia.dpdns.org/api/engines*"
 zone_name = "aixodia.dpdns.org"
