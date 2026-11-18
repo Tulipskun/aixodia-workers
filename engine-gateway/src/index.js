@@ -3,11 +3,15 @@
 //!
 //! Request /<instance>/api/...  →  https://<instance>.<origin suffix>/api/...
 //!
-//! The first path segment names the instance; the Workers KV entry under that
-//! name holds the origin hostname its own Named Tunnel answers on. The segment
-//! is removed before the request is forwarded, so every engine keeps serving the
-//! paths it has always served (/api/..., /ws, /healthz) and nothing in the engine
-//! or the phone has to know it arrived through a shared address.
+//! The first path segment names the instance; the `engines` table in D1 holds
+//! that instance's own origin hostname. The segment is removed before the
+//! request is forwarded, so every engine keeps serving the paths it has always
+//! served (/api/..., /ws, /healthz) and nothing in the engine or the phone has
+//! to know it arrived through a shared address.
+//!
+//! `GET /engines` answers the registry itself, so the console learns which
+//! engines exist from the same table this Worker routes by instead of keeping a
+//! second copy in Workers KV.
 
 // The same shape the engine enforces (aixodia_state::valid_instance_name):
 // 32 characters at most, alnum at both ends, single hyphens between.
@@ -34,14 +38,36 @@ function error(status, message) {
   });
 }
 
+function list(engines) {
+  return new Response(JSON.stringify({ engines }), {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const segments = url.pathname.split("/").filter(Boolean);
+    if (!env.DB) return error(503, "Gateway is not configured");
+
+    // The registry itself, for the console's engine switcher.
+    if (segments.length === 1 && segments[0] === "engines") {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return error(405, "The registry is read-only here");
+      }
+      const { results } = await env.DB.prepare(
+        "SELECT id, name, url, subtitle, tag FROM engines ORDER BY created_at, id"
+      ).all();
+      return list(results || []);
+    }
+
     const instance = segments[0] || "";
     if (!INSTANCE_NAME.test(instance)) return error(404, "Unknown instance");
-    if (!env.ENGINE_ORIGINS) return error(503, "Gateway is not configured");
-    const origin = await env.ENGINE_ORIGINS.get(instance);
+    const row = await env.DB.prepare("SELECT origin_host FROM engines WHERE id = ?1")
+      .bind(instance)
+      .first();
+    const origin = row ? row.origin_host : null;
     if (!origin || !ORIGIN_HOST.test(origin)) return error(404, "Unknown instance");
     if (!env.ACCESS_CLIENT_ID || !env.ACCESS_CLIENT_SECRET) {
       return error(503, "Origin authentication is not configured");

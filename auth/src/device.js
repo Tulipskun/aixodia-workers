@@ -326,47 +326,21 @@ export async function activeSessions(env, req) {
 
 // ---------------------------------------------------------------- multi-engine push
 
+/**
+ * Where a revocation has to reach: the engines table in D1, plus `ENGINE_URL`
+ * for a deployment that has only one engine and no registry row.
+ */
 export async function resolveEngineTargets(env) {
   const urls = new Set()
-  const addRaw = (raw) => {
-    if (!raw) return
-    const trimmed = String(raw).trim()
-    if (!trimmed) return
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed)
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            const u = typeof item === 'string' ? item : item?.url
-            if (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) {
-              urls.add(u.trim().replace(/\/+$/, ''))
-            }
-          }
-        }
-      } catch {
-        /* ignore malformed JSON */
-      }
-      return
-    }
-    for (const part of trimmed.split(',')) {
-      const token = part.trim()
-      if (!token) continue
-      const eq = token.indexOf('=')
-      const candidate = (eq > 0 ? token.slice(eq + 1) : token).trim().replace(/\/+$/, '')
+  if (env.DB) {
+    const { results } = await env.DB.prepare('SELECT url FROM engines ORDER BY created_at, id').all()
+    for (const row of results || []) {
+      const candidate = String(row.url || '').trim().replace(/\/+$/, '')
       if (/^https?:\/\//i.test(candidate)) urls.add(candidate)
     }
   }
-
-  addRaw(env.ENGINE_URLS)
-  addRaw(env.ENGINES_JSON)
-  if (env.CONFIG && typeof env.CONFIG.get === 'function') {
-    try {
-      addRaw(await env.CONFIG.get('engines'))
-    } catch {
-      /* ignore KV read failure */
-    }
-  }
-  addRaw(env.ENGINE_URL)
+  const single = String(env.ENGINE_URL || '').trim().replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(single)) urls.add(single)
   return Array.from(urls)
 }
 

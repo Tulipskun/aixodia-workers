@@ -14,6 +14,7 @@ import {
   deviceToken,
   revoke,
   activeSessions,
+  resolveEngineTargets,
 } from '../src/device.js'
 import { hooks } from '../src/shared.js'
 
@@ -82,6 +83,16 @@ CREATE TABLE rate_limits (
   key TEXT PRIMARY KEY NOT NULL,
   window_start INTEGER NOT NULL,
   count INTEGER NOT NULL
+);
+CREATE TABLE engines (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  origin_host TEXT,
+  subtitle TEXT,
+  tag TEXT,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 `
 
@@ -239,4 +250,20 @@ test('a revoked approver is refused by the allowlist, not the signature', async 
   } finally {
     approverEmail = 'operator@example.com'
   }
+})
+
+test('revocations go to the engines the registry names', async () => {
+  const env = setup()
+  // An engine with no row in the registry is a target nobody can revoke.
+  await env.DB.prepare(
+    "INSERT INTO engines (id, name, url, origin_host) VALUES ('m-aaaabbbb', 'Phone', 'https://engines.aixodia.dpdns.org/m-aaaabbbb', 'm-aaaabbbb.aixodia.dpdns.org')",
+  ).run()
+  const targets = await resolveEngineTargets(env)
+  assert.deepEqual(targets, ['https://engines.aixodia.dpdns.org/m-aaaabbbb'])
+})
+
+test('a deployment with one engine and no registry still pushes to ENGINE_URL', async () => {
+  const env = setup()
+  env.ENGINE_URL = 'https://engine.aixodia.dpdns.org/'
+  assert.deepEqual(await resolveEngineTargets(env), ['https://engine.aixodia.dpdns.org'])
 })

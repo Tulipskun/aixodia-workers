@@ -6,18 +6,30 @@ three jobs, no shared storage between them.
 | Directory | Worker | Serves |
 |---|---|---|
 | `auth/` | `aixodia-auth` | sign-in: device codes, sessions, tokens, Access JWT verification |
-| `engine-gateway/` | `aixodia-engine-gateway` | one public address for every engine machine: `engines.aixodia.dpdns.org/<machine>/…` |
+| `engine-gateway/` | `aixodia-engine-gateway` | one public address for every engine machine: `engines.aixodia.dpdns.org/<machine>/…`, plus `GET /engines` from the `engines` table in D1 |
 | `mcp-gateway/` | `aixodia-mcp-gateway` | one public address for every droidime device: `mcp.aixodia.dpdns.org/<device>/…` |
 
 Each directory is a self-contained Worker with its own `wrangler.toml`, its own
-KV namespace binding and its own tests. They live in one repository because they
-deploy the same way and answer on the same zone; they share no code, no KV
-namespace and no secret.
+storage binding and its own tests. They live in one repository because they deploy
+the same way and answer on the same zone; they share no code, no storage namespace
+and no secret.
+
+Where the data lives:
+
+| Worker | Storage |
+|---|---|
+| `auth` | KV `AIXODIA_CONFIG` (allowlist, sync secret, Access team) + D1 `aixodia` (codes, tokens, rate limits) |
+| `engine-gateway` | D1 `aixodia`, table `engines` — the engine registry and the origin each one answers on |
+| `mcp-gateway` | KV `DEVICE_TUNNELS` — one entry per droidime device |
+
+`schema.sql` is the D1 schema these Workers rely on; it is idempotent and applied
+by hand.
 
 ## Rules
 
-* One Worker owns one KV namespace. A Worker never reads or writes another
-  Worker's namespace.
+* One Worker owns one storage namespace. A Worker never reads or writes another
+  Worker's namespace. The D1 database is the one shared store, and each table has
+  one owner: `engines` belongs to `engine-gateway`, the sign-in tables to `auth`.
 * Nothing here is imported by the engine, the console or the Android app. They
   reach these Workers over HTTPS only.
 * Deploys are manual (`wrangler deploy`) and are not tied to a push.
