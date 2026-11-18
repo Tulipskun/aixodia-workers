@@ -1,0 +1,42 @@
+name = "aixodia-auth"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Configuration only — read on nearly every request, written almost never.
+# This is the access pattern KV is for: the allowlist and the Access team are set
+# by an operator and then never touched.
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "b9159aba166f4f5c974250310f4459f7"
+
+# Sessions, in D1 rather than KV.
+#
+# Every sign-in writes a row, every confirm updates one, and every status poll
+# reads one. KV is priced and designed for reads; writes are rare and take up to
+# a minute to become visible everywhere. A session that is confirmed but still
+# reads as pending for a minute is not a cache miss, it is a broken sign-in, so
+# sessions belong in a store that is consistent on write.
+[[d1_databases]]
+binding = "DB"
+database_name = "aixodia"
+database_id = "e8e746ea-691e-43bf-9fe2-c4e4016f29a1"
+
+[vars]
+# Comma-separated. Empty means nobody signs in by email, which is the safe
+# reading of "not configured". The KV key auth/allowed_emails overrides it.
+AUTH_ALLOWED_EMAILS = ""
+
+# The Access applications that may vouch for a browser here, comma-separated.
+# There are several because the console origin and the engine's own hostname are
+# protected separately, and a session issued by one is a real session at the other.
+# ACCESS_APP_AUD in KV stays the primary; this only widens what is accepted.
+ACCESS_ACCEPTED_AUDIENCES = "9cb93a11871fead4219e2a9f3f303cc17b9d809d426c26e208e8f1cf1c1a9bcf,1e2270863178234a46c4f3e1c91a4dc2558d6b428258e4b63ff365fea607cbbd"
+
+# Where the engine's push target lives.
+ENGINE_URL = "https://engine.aixodia.dpdns.org"
+
+# The console origin, used to build the approve-page link the app shows.
+PUBLIC_URL = "https://aixodia.dpdns.org"
+
+[observability]
+enabled = true
