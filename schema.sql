@@ -16,9 +16,9 @@ CREATE TABLE IF NOT EXISTS engines (
   tag         TEXT,
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-  -- When the gateway last got a healthy answer from this engine's /healthz, and
-  -- the version it reported. The gateway answers from these stamps and probes
-  -- afterwards, so a client never waits for a round trip through the tunnel.
-  online_at      INTEGER NOT NULL DEFAULT 0,
-  online_version TEXT NOT NULL DEFAULT ''
+  -- A lease the engine keeps: it writes this every twenty seconds, and a row
+  -- nobody has heard from for a lease length is offline. The gateway only reads
+  -- it — no cron, no probe, nothing on the way to an answer.
+  heartbeat_at INTEGER NOT NULL DEFAULT 0,
+  version      TEXT NOT NULL DEFAULT ''
 );

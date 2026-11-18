@@ -19,32 +19,20 @@ https://engine.aixodia.dpdns.org/api/engines
                   "online":true,"version":"v1.177"}]}
 ```
 
-## The registry never waits for a probe
+## Liveness is a lease the engine keeps
 
-Asking every engine `/healthz` on the way to the answer costs the caller the whole
-round trip through Access and the tunnel — hundreds of milliseconds for a flag
-that changes on a scale of seconds. So:
+`online` is not a probe result. Each engine writes `heartbeat_at` in the
+`engines` table every twenty seconds, and the gateway answers with
+`heartbeat_at > 0 AND unixepoch() - heartbeat_at <= 60` — the TTL-lease shape
+Consul checks and Kubernetes node leases use.
 
-* the answer is built from `online_at` / `online_version`, two columns the
-  gateway writes (migration `001_engine_online.sql`), and `online` means
-  "answered within the last minute";
-* the probes run **after** the response (`ctx.waitUntil`), all engines at once,
-  2.5s timeout each, and the results go back to the table in one `DB.batch`, so
-  the next answer is the fresh one;
-* a **cron trigger once a minute** does the same probing with nobody asking, so a
-  phone that opens after a quiet hour is not told that every engine is offline.
-  Its run is recorded in `system_state.gateway/probe_run_at` — a schedule that
-  silently stopped would otherwise look like every engine going down together;
-* a failed probe writes nothing: a busy box must not be marked offline, so the
-  stamp it has ages out of the one-minute window on its own;
-* the rows themselves are read from D1 at most once per 30s per isolate, and a
-  stale copy is answered while a refresh runs behind it;
-* `[placement] mode = "smart"` keeps the Worker near the origin it keeps talking
-  to, not near each caller.
+Probing on the way to an answer cost the caller the whole round trip through
+Access and the tunnel, needed a cron to stay fresh when nobody asked, and
+measured the gateway's reach rather than the engine's life. None of that is here:
+the registry is one D1 read, and `version` rides on the same beat.
 
-Measured from the same machine, five calls each: `GET /api/engines` went from
-0.25–0.52s to 0.04–0.15s. The forward path is a different story — it is dominated
-by the origin, not by this Worker.
+The engine's own socket is what decides whether the engine a phone is on can be
+reached right now — the lease only says the process is running.
 
 ## This Worker is the whole hostname
 
@@ -67,7 +55,7 @@ policy is a `non_identity` service-token rule, so the token below is the one way
 in:
 
 ```
-ACCESS_CLIENT_ID / ACCESS_CLIENT_SECRET   (secret bindings, and the probes use them too)
+ACCESS_CLIENT_ID / ACCESS_CLIENT_SECRET   (secret bindings, used by the forward)
 ```
 
 `GET https://m-8a7d1192.aixodia.dpdns.org/healthz` without that token answers 403.
