@@ -6,7 +6,7 @@ three jobs, no shared storage between them.
 | Directory | Worker | Serves |
 |---|---|---|
 | `auth/` | `aixodia-auth` | sign-in: device codes, sessions, tokens, Access JWT verification |
-| `engine-gateway/` | `aixodia-engine-gateway` | one public address for every engine machine: `engines.aixodia.dpdns.org/<machine>/…`, plus `GET /engines` from the `engines` table in D1 |
+| `engine-gateway/` | `aixodia-engine-gateway` | `GET /api/engines` — the registry from the `engines` table in D1 — and, when a deployment has more than one machine, one public address for all of them |
 | `mcp-gateway/` | `aixodia-mcp-gateway` | one public address for every droidime device: `mcp.aixodia.dpdns.org/<device>/…` |
 
 Each directory is a self-contained Worker with its own `wrangler.toml`, its own

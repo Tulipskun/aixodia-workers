@@ -1,11 +1,22 @@
 # AIxodia engine gateway
 
-Gives every machine's engine its own path on **one** public hostname:
+Answers "which engines are there" at the address the engine already has:
 
 ```
-https://engines.aixodia.dpdns.org/<machine>/api/...   →   https://<machine>.aixodia.dpdns.org/api/...
-https://engines.aixodia.dpdns.org/engines             →   {"engines": [...]}
+https://engine.aixodia.dpdns.org/api/engines   →   {"engines": [...]}
 ```
+
+and, once there is more than one machine, gives every engine its own path on
+**one** public hostname:
+
+```
+https://<gateway host>/<machine>/api/...   →   https://<machine>.aixodia.dpdns.org/api/...
+```
+
+The proxy half is deployed but unrouted while the deployment has one engine: one
+engine already has one address, and `/api/engines` rides the Access bypass that
+`/api/*` already has. Giving the proxy a hostname later is one route plus one D1
+row, not new code.
 
 `<machine>` is the name the engine gives itself: `m-` plus eight hex digits of
 its `/etc/machine-id`, or whatever `AIXODIA_INSTANCE` overrides it with. It is
@@ -34,18 +45,20 @@ CREATE TABLE engines (
 
 `schema.sql` in the repository root creates it and is idempotent.
 
-* `GET /engines` answers the registry (id, name, url, subtitle, tag — never the
-  tunnel hostname) so the console's engine switcher has one source of truth.
+* `GET /api/engines` (and `GET /engines` on whatever host the route names)
+  answers the registry — id, name, url, subtitle, tag, never the tunnel hostname
+  — so the console's engine switcher has one source of truth.
 * Every proxied request reads `origin_host` from the same row.
 * The sign-in Worker reads the same `url` column when it pushes a revocation to
   every engine, so a new engine is one `INSERT` for all three consumers.
 
-Adding a machine is a row, not a deploy:
+Adding a machine is a row, not a deploy (its `url` is the address clients call —
+`https://engine.aixodia.dpdns.org` while there is only one):
 
 ```bash
 npx wrangler d1 execute aixodia --remote --command \
   "INSERT INTO engines (id, name, url, origin_host) VALUES
-     ('m-abc12345', 'Work phone', 'https://engines.aixodia.dpdns.org/m-abc12345', 'm-abc12345.aixodia.dpdns.org')"
+     ('m-abc12345', 'Work phone', 'https://m-abc12345.aixodia.dpdns.org', 'm-abc12345.aixodia.dpdns.org')"
 ```
 
 ## Why a gateway instead of one hostname per engine
@@ -59,10 +72,11 @@ path segment that names the instance.
 ## Cloudflare resources
 
 - Zone `aixodia.dpdns.org` on the account.
-- Worker route `engines.aixodia.dpdns.org/*`.
+- Worker route `engine.aixodia.dpdns.org/api/engines*` (add a gateway hostname
+  route when a second machine exists).
 - D1 database `aixodia` bound as `DB`, holding the `engines` table.
-- A proxied DNS record for `engines.aixodia.dpdns.org` (a CNAME to
-  `aixodia.dpdns.org` is enough) or the route has no name to answer on.
+- The engine hostname's Access application must bypass `/api/*`, which it does
+  for the engine's own API anyway.
 - Access application protecting `*.aixodia.dpdns.org/*` with a service-token
   policy, and that token stored as the `ACCESS_CLIENT_ID` /
   `ACCESS_CLIENT_SECRET` secrets.

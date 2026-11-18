@@ -51,8 +51,13 @@ export default {
     const segments = url.pathname.split("/").filter(Boolean);
     if (!env.DB) return error(503, "Gateway is not configured");
 
-    // The registry itself, for the console's engine switcher.
-    if (segments.length === 1 && segments[0] === "engines") {
+    // The registry itself, for the console's engine switcher. It answers on the
+    // gateway's own hostname and, while there is one engine, under the engine's
+    // `/api/` prefix — the path every client already has an Access bypass for.
+    const registryPath =
+      (segments.length === 1 && segments[0] === "engines") ||
+      (segments.length === 2 && segments[0] === "api" && segments[1] === "engines");
+    if (registryPath) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return error(405, "The registry is read-only here");
       }

@@ -10,6 +10,10 @@ binding = "DB"
 database_name = "aixodia"
 database_id = "e8e746ea-691e-43bf-9fe2-c4e4016f29a1"
 
+# One engine needs one address, and it already has one: the registry answers under
+# the engine's own `/api/` prefix, which its Access bypass already covers. The
+# `<machine>/...` proxy stays in the code for the day a second machine exists;
+# giving it a hostname is then one route and one KV-free D1 row, not new code.
 [[routes]]
-pattern = "engines.aixodia.dpdns.org/*"
+pattern = "engine.aixodia.dpdns.org/api/engines*"
 zone_name = "aixodia.dpdns.org"

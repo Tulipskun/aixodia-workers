@@ -75,6 +75,14 @@ test("answers the registry, without the tunnel hostnames", async () => {
   });
 });
 
+test("answers the registry under the engine's api prefix too", async () => {
+  const response = await worker.fetch(new Request("https://engine.aixodia.dpdns.org/api/engines"), {
+    DB: registry([machine])
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).engines.length, 1);
+});
+
 test("the registry is read-only", async () => {
   const response = await worker.fetch(
     new Request("https://engines.aixodia.dpdns.org/engines", { method: "POST" }),
