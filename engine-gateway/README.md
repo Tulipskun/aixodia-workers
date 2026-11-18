@@ -117,42 +117,62 @@ exist, which makes it the only place that can be wrong.
 ## Cloudflare resources
 
 - Zone `aixodia.dpdns.org` on the account.
-- Worker route `engine.aixodia.dpdns.org/api/engines*`.
+- Worker route `engine.aixodia.dpdns.org/*` — the whole hostname, because the
+  Worker forwards as well as lists.
 - D1 database `aixodia` bound as `DB`, holding the `engines` table.
-- The engine hostname's Access application must bypass `/api/*` and `/healthz`,
-  which it does for the engine's own API anyway. A named path needs the same
-  bypass under the name: `engine.aixodia.dpdns.org/<name>/api` and
-  `engine.aixodia.dpdns.org/<name>/healthz` (one application each, no policy but
-  `bypass`) — that is what lets the console call an engine through its name.
+- Secrets `ACCESS_CLIENT_ID` / `ACCESS_CLIENT_SECRET`: the service token of the
+  origin Access application, so a forward is admitted to the engine's tunnel
+  hostname. `wrangler secret put` — never in the toml.
 
-There is no service token here any more: nothing is forwarded, so nothing has to
-authenticate to an origin.
+### The bypass list, which has to grow with every engine
+
+Cloudflare Access guards `engine.aixodia.dpdns.org` in front of this Worker, and
+an Access application is matched by path, not by pattern — there are no path
+wildcards. A client that authenticates with the engine's own bearer token rather
+than an Access session therefore needs a **bypass application per path**, and
+because engines are addressed as `/<name>/…`, per path **per engine**:
+
+```
+engine.aixodia.dpdns.org/<name>/api        bypass, everyone
+engine.aixodia.dpdns.org/<name>/healthz    bypass, everyone
+engine.aixodia.dpdns.org/<name>/terminal   bypass, everyone   (WebSocket, ticket auth)
+engine.aixodia.dpdns.org/<name>/restart    bypass, everyone
+```
+
+Missing one is not a 403 that reads like a refusal — Access answers a WebSocket
+handshake with a **302 to its login page**, so the phone's socket sits at
+"connecting" forever and nothing in the engine's log shows a request. That is
+exactly what happened when the address moved from a hostname per engine to
+`/<name>/…`: `/api` and `/healthz` were recreated under the name, `/terminal` and
+`/restart` were not.
+
+Doing this by hand for every new engine is the obvious wart. The fix is a second
+hostname served by this same Worker with no Access application on it —
+`gw.aixodia.dpdns.org` — for clients, leaving `engine.…` Access-protected for
+browsers. That removes the bypass list entirely; until then, adding an engine
+means adding four applications.
 
 ## Deploy
 
 ```bash
 npx wrangler d1 execute aixodia --remote --file=../schema.sql
-npx wrangler deploy
+npx wrangler deploy --config engine-gateway/wrangler.toml
 ```
 
 ## Provisioning a second machine
 
 1. Create a remotely-managed Named Tunnel for it.
-2. Point its public hostname, e.g. `work.aixodia.dpdns.org`, at
-   `http://localhost:8787` — the engine's port is the same on every machine.
-3. Protect that hostname with the Access application and its policies.
-4. Write its own two keys in Workers KV `AIXODIA_CONFIG`:
-   `instances/<machine>/tunnel_token` (the tunnel connector token) and
-   `instances/<machine>/tunnel_url` (`https://work.aixodia.dpdns.org`).
-5. `aixodia start` — `CF_TOKEN` is the only variable it needs. The engine inserts
-   its own row (and prints the name it got: `public name …`).
+2. Point a hostname only this Worker uses, e.g. `work.aixodia.dpdns.org`, at
+   `http://localhost:8787`, and give that hostname an Access application whose
+   only policy is the origin service token (`non_identity`) — no browser ever
+   needs it.
+3. Write its own `instances/<machine>/tunnel_token` and
+   `instances/<machine>/tunnel_url` in Workers KV `AIXODIA_CONFIG`.
+4. `aixodia start` — `CF_TOKEN` is the only variable it needs. The engine inserts
+   its own row, gets a name (`public name …`) and starts beating.
 
-Steps 1–3 are the provisioning; no `INSERT` and no deploy. Adding the named
-Access bypasses for that engine's name is the only registry-side work, and only
-the console needs it.
-
-The engine publishes its live address to `instances/<machine>/daemon/url` and its
-version to `instances/<machine>/daemon/version`.
+No `INSERT` by hand, no DNS record clients see, no ingress edit beyond step 2.
+The only registry-side work is the four bypass applications above.
 
 ## Test
 
