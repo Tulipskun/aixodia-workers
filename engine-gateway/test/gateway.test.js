@@ -130,11 +130,11 @@ test("a probe carries the service token, because the origin admits nothing else"
   }
 });
 
-test("an engine that does not answer is written back as offline", async () => {
+test("a failed probe is not written, so a busy box is not turned offline", async () => {
   const db = registry(rows);
   const { tail } = await run(registryRequest(), { db, answer: () => new Response("no", { status: 502 }) });
   await tail[0];
-  assert.deepEqual(db.writes[0], [0, "", "work-1"]);
+  assert.deepEqual(db.writes, []);
 });
 
 test("the rows are read once for a burst of requests", async () => {

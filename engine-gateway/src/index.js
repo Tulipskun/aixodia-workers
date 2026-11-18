@@ -128,9 +128,14 @@ async function refreshHealth(env, rows, now) {
   );
 
   const stamp = Math.floor(Date.now() / 1000);
-  const statements = answers.map((answer) =>
+  // Only healthy answers are written. A failed probe says nothing about a
+  // machine that answered a minute ago — a busy box or a slow second must not
+  // turn it offline — so the stamp it already has is left to age out of the
+  // one-minute window on its own.
+  const healthy = answers.filter((answer) => answer.online);
+  const statements = healthy.map((answer) =>
     env.DB.prepare("UPDATE engines SET online_at = ?1, online_version = ?2 WHERE id = ?3").bind(
-      answer.online ? stamp : 0,
+      stamp,
       answer.version || "",
       answer.id
     )
@@ -143,10 +148,10 @@ async function refreshHealth(env, rows, now) {
 
   const cache = remembered(env);
   if (!cache) return;
-  for (const answer of answers) {
+  for (const answer of healthy) {
     const row = cache.rows.find((item) => item.id === answer.id);
     if (!row) continue;
-    row.online_at = answer.online ? stamp : 0;
+    row.online_at = stamp;
     row.online_version = answer.version || "";
   }
 }
