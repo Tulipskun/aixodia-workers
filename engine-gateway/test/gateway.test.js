@@ -208,6 +208,51 @@ test("an engine without an origin cannot be forwarded to", async () => {
   assert.equal(response.status, 502);
 });
 
+test("the cron refreshes the stamps with nobody asking", async () => {
+  const db = registry([{ ...rows[1] }]);
+  const inner = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    if (/INSERT INTO system_state/i.test(sql)) {
+      return { bind: (...args) => ({ async run() { db.marks = args; } }) };
+    }
+    return inner(sql);
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, version: "v1.170" }), { status: 200 });
+  try {
+    await worker.scheduled({ cron: "* * * * *" }, { DB: db, ...env }, { waitUntil: () => {} });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(db.writes[0], [Math.floor(Date.now() / 1000), "v1.170", "work-1"]);
+  assert.ok(db.marks, "the run is recorded");
+});
+
+test("a cron with no registry does nothing", async () => {
+  await worker.scheduled({ cron: "* * * * *" }, {}, { waitUntil: () => {} });
+});
+
+test("a cron whose probe fails still records that it ran", async () => {
+  const db = registry([{ ...rows[1] }]);
+  const inner = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    if (/INSERT INTO system_state/i.test(sql)) {
+      return { bind: (...args) => ({ async run() { db.marks = args; } }) };
+    }
+    return inner(sql);
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("no route");
+  };
+  try {
+    await worker.scheduled({ cron: "* * * * *" }, { DB: db, ...env }, { waitUntil: () => {} });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(db.marks, "the run is recorded even when nothing answered");
+});
+
 test("fails closed when the registry is not configured", async () => {
   const response = await worker.fetch(registryRequest(), {});
   assert.equal(response.status, 503);

@@ -27,7 +27,9 @@
 //! answer whose `online` means "answered within the last minute", and the next
 //! answer is the fresh one.
 
-const PROBE_TIMEOUT_MS = 1000;
+// Nothing waits on a probe, so the timeout is only about not hanging: a busy
+// engine crossing two edges can take a second and still be perfectly alive.
+const PROBE_TIMEOUT_MS = 2500;
 /// How old a stamp may be before the background probes run again.
 const PROBE_AFTER_MS = 8000;
 /// A stamp this recent still counts as online.
@@ -182,6 +184,28 @@ async function forward(request, row, env) {
 }
 
 export default {
+  /// The stamps must not depend on somebody asking for the list: a phone that
+  /// opens after a quiet hour would otherwise be told nothing is online. A
+  /// minute is the same cadence the probes run at anyway.
+  async scheduled(event, env, ctx) {
+    if (!env.DB) return;
+    try {
+      // A cron has nobody to report to, so the only record that it ran at all
+      // is this row — without it a schedule that silently stopped would look
+      // exactly like a fleet of engines that went down together.
+      const ran = Math.floor(Date.now() / 1000);
+      await env.DB.prepare(
+        "INSERT INTO system_state (key, value, updated_at) VALUES ('gateway/probe_run_at', ?1, ?2) " +
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind(String(ran), ran).run();
+      const rows = await readRows(env);
+      await refreshHealth(env, rows, Date.now());
+    } catch (error) {
+      // The next minute tries again; this is the only trace a cron leaves.
+      console.error(`probe run failed: ${error && error.message}`);
+    }
+  },
+
   async fetch(request, env, ctx) {
     if (!env.DB) return error(503, "The engine registry is not configured");
 

@@ -29,8 +29,14 @@ that changes on a scale of seconds. So:
   gateway writes (migration `001_engine_online.sql`), and `online` means
   "answered within the last minute";
 * the probes run **after** the response (`ctx.waitUntil`), all engines at once,
-  1s timeout each, and the results go back to the table in one `DB.batch`, so the
-  next answer is the fresh one;
+  2.5s timeout each, and the results go back to the table in one `DB.batch`, so
+  the next answer is the fresh one;
+* a **cron trigger once a minute** does the same probing with nobody asking, so a
+  phone that opens after a quiet hour is not told that every engine is offline.
+  Its run is recorded in `system_state.gateway/probe_run_at` — a schedule that
+  silently stopped would otherwise look like every engine going down together;
+* a failed probe writes nothing: a busy box must not be marked offline, so the
+  stamp it has ages out of the one-minute window on its own;
 * the rows themselves are read from D1 at most once per 30s per isolate, and a
   stale copy is answered while a refresh runs behind it;
 * `[placement] mode = "smart"` keeps the Worker near the origin it keeps talking

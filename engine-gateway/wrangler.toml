@@ -22,3 +22,8 @@ zone_name = "aixodia.dpdns.org"
 # Smart Placement puts the Worker next to whatever the requests keep talking to.
 [placement]
 mode = "smart"
+
+# Keeps the online stamps fresh without waiting for a client to ask, so a phone
+# that opens after a quiet hour is not told that every engine is offline.
+[triggers]
+crons = ["* * * * *"]
