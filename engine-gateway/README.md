@@ -120,37 +120,40 @@ exist, which makes it the only place that can be wrong.
 - Worker route `engine.aixodia.dpdns.org/*` — the whole hostname, because the
   Worker forwards as well as lists.
 - D1 database `aixodia` bound as `DB`, holding the `engines` table.
+- Access application on the identity path only (see below).
 - Secrets `ACCESS_CLIENT_ID` / `ACCESS_CLIENT_SECRET`: the service token of the
   origin Access application, so a forward is admitted to the engine's tunnel
   hostname. `wrangler secret put` — never in the toml.
 
-### The bypass list, which has to grow with every engine
+### Access is for identity only, and it is not in the data path
 
-Cloudflare Access guards `engine.aixodia.dpdns.org` in front of this Worker, and
-an Access application is matched by path, not by pattern — there are no path
-wildcards. A client that authenticates with the engine's own bearer token rather
-than an Access session therefore needs a **bypass application per path**, and
-because engines are addressed as `/<name>/…`, per path **per engine**:
+`engine.aixodia.dpdns.org` used to be one Access application covering the whole
+hostname, with a bypass application for every path a client needed — and because
+engines are addressed as `/<name>/…`, that meant four bypasses **per engine**.
+Missing one was not a refusal that read like a refusal: Access answered the
+WebSocket handshake with a **302 to its login page**, so the phone's terminal sat
+at "connecting" forever with nothing in the engine's log.
+
+Access now guards exactly one path:
 
 ```
-engine.aixodia.dpdns.org/<name>/api        bypass, everyone
-engine.aixodia.dpdns.org/<name>/healthz    bypass, everyone
-engine.aixodia.dpdns.org/<name>/terminal   bypass, everyone   (WebSocket, ticket auth)
-engine.aixodia.dpdns.org/<name>/restart    bypass, everyone
+engine.aixodia.dpdns.org/api/auth/callback    allow, the owner's identity
 ```
 
-Missing one is not a 403 that reads like a refusal — Access answers a WebSocket
-handshake with a **302 to its login page**, so the phone's socket sits at
-"connecting" forever and nothing in the engine's log shows a request. That is
-exactly what happened when the address moved from a hostname per engine to
-`/<name>/…`: `/api` and `/healthz` were recreated under the name, `/terminal` and
-`/restart` were not.
+That is the whole of its job: it proves who the browser user is, the engine ties
+that subject to the one-time sign-in code, and the client leaves with a token.
+Everything else — `/api/*`, `/terminal`, `/restart`, `/<name>/…`, `/healthz` — is
+plain public HTTP answered by the engine, which authorises with its own bearer
+token (and single-use tickets for sockets). There is no bypass application to add
+when a machine joins, so the list cannot be wrong.
 
-Doing this by hand for every new engine is the obvious wart. The fix is a second
-hostname served by this same Worker with no Access application on it —
-`gw.aixodia.dpdns.org` — for clients, leaving `engine.…` Access-protected for
-browsers. That removes the bypass list entirely; until then, adding an engine
-means adding four applications.
+The application keeps its id and its audience (`kid`) across this narrowing, which
+is why the login URL the app builds still resolves; the audience is what both the
+app and the engine verify.
+
+The origin hostname keeps its own Access application, whose only policy is the
+service token (`non_identity`). That one is machine to machine — this Worker to
+the tunnel — and is never in front of a person.
 
 ## Deploy
 
@@ -172,7 +175,8 @@ npx wrangler deploy --config engine-gateway/wrangler.toml
    its own row, gets a name (`public name …`) and starts beating.
 
 No `INSERT` by hand, no DNS record clients see, no ingress edit beyond step 2.
-The only registry-side work is the four bypass applications above.
+No Access work: the identity application is on the callback path and does not
+change when a machine joins.
 
 ## Test
 
