@@ -9,9 +9,10 @@ binding = "DB"
 database_name = "aixodia"
 database_id = "e8e746ea-691e-43bf-9fe2-c4e4016f29a1"
 
-# Each engine is addressed at its own tunnel host under its own name
-# (`https://<engine host>/<name>/…`), so no path on this hostname is forwarded
-# any more: only the list of engines is answered here.
+# This Worker is the whole hostname: it answers the registry and forwards every
+# other request to the engine the path names, or to the first engine when it
+# names none. The engines' own tunnel hosts are not public — each has an Access
+# application that admits only this Worker's service token.
 [[routes]]
-pattern = "engine.aixodia.dpdns.org/api/engines*"
+pattern = "engine.aixodia.dpdns.org/*"
 zone_name = "aixodia.dpdns.org"
