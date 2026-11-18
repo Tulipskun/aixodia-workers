@@ -15,5 +15,10 @@ CREATE TABLE IF NOT EXISTS engines (
   subtitle    TEXT,
   tag         TEXT,
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+  -- When the gateway last got a healthy answer from this engine's /healthz, and
+  -- the version it reported. The gateway answers from these stamps and probes
+  -- afterwards, so a client never waits for a round trip through the tunnel.
+  online_at      INTEGER NOT NULL DEFAULT 0,
+  online_version TEXT NOT NULL DEFAULT ''
 );

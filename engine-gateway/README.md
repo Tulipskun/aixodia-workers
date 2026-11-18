@@ -19,6 +19,27 @@ https://engine.aixodia.dpdns.org/api/engines
                   "online":true,"version":"v1.177"}]}
 ```
 
+## The registry never waits for a probe
+
+Asking every engine `/healthz` on the way to the answer costs the caller the whole
+round trip through Access and the tunnel — hundreds of milliseconds for a flag
+that changes on a scale of seconds. So:
+
+* the answer is built from `online_at` / `online_version`, two columns the
+  gateway writes (migration `001_engine_online.sql`), and `online` means
+  "answered within the last minute";
+* the probes run **after** the response (`ctx.waitUntil`), all engines at once,
+  1s timeout each, and the results go back to the table in one `DB.batch`, so the
+  next answer is the fresh one;
+* the rows themselves are read from D1 at most once per 30s per isolate, and a
+  stale copy is answered while a refresh runs behind it;
+* `[placement] mode = "smart"` keeps the Worker near the origin it keeps talking
+  to, not near each caller.
+
+Measured from the same machine, five calls each: `GET /api/engines` went from
+0.25–0.52s to 0.04–0.15s. The forward path is a different story — it is dominated
+by the origin, not by this Worker.
+
 ## This Worker is the whole hostname
 
 A client is given one address, `https://engine.aixodia.dpdns.org`, and nothing

@@ -4,9 +4,9 @@
 //! other side of it is a set of engines, each reachable at `/<name>/…`, and only
 //! this Worker knows which of them exist:
 //!
-//! * `GET /api/engines` — the registry, read from D1 and answered with a live
-//!   `online` flag per engine, because "which engine can I use" is the question
-//!   a client actually has. The flags are probes of each engine's `/healthz`.
+//! * `GET /api/engines` — the registry, read from D1 and answered with an
+//!   `online` flag per engine, because "which engine can I use" is the question a
+//!   client actually has.
 //! * `/<name>/…` — forwarded to that engine's own tunnel origin, which serves
 //!   the path itself (the engine takes its name off before routing).
 //! * anything else — forwarded to the first engine, unchanged. That keeps
@@ -16,9 +16,24 @@
 //! admits the service token below and nothing else (`non_identity`), so this
 //! Worker is the only way in through them. It is also why the forward sets the
 //! token rather than relying on the caller having one.
+//!
+//! ## Why nothing here waits for a probe
+//!
+//! Asking every engine `/healthz` on the way to an answer costs the client the
+//! whole round trip through Access and the tunnel — hundreds of milliseconds for
+//! a flag that changes on a scale of seconds. So the answer is built from stamps
+//! already in the table, and the probes run **after** the response, updating
+//! those stamps (`online_at`, `online_version`). A client therefore gets a fast
+//! answer whose `online` means "answered within the last minute", and the next
+//! answer is the fresh one.
 
-const PROBE_TIMEOUT_MS = 2000;
-const REGISTRY_TTL_MS = 15_000;
+const PROBE_TIMEOUT_MS = 1000;
+/// How old a stamp may be before the background probes run again.
+const PROBE_AFTER_MS = 8000;
+/// A stamp this recent still counts as online.
+const ONLINE_WINDOW_MS = 60_000;
+/// How long this isolate may answer from its own copy of the rows.
+const ROWS_TTL_MS = 30_000;
 
 function json(status, body) {
   return new Response(JSON.stringify(body), {
@@ -31,39 +46,40 @@ function error(status, message) {
   return json(status, { error: message });
 }
 
-/// The engines, cached for a few seconds so a burst of API calls is one D1 read.
+/// Work that must happen but must not hold the response: the request lifetime of
+/// a Worker ends with the response, so this is the one place to spend the tail.
+function after(ctx, promise) {
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(promise);
+  else promise.catch(() => {});
+}
+
 const caches = new WeakMap();
 
-async function engines(env) {
-  const cache = caches.get(env.DB) || { at: 0, rows: [] };
-  if (Date.now() - cache.at < REGISTRY_TTL_MS) return cache.rows;
+function remembered(env) {
+  return caches.get(env.DB);
+}
+
+async function readRows(env) {
   const { results } = await env.DB.prepare(
-    "SELECT id, name, url, origin_host, subtitle, tag FROM engines ORDER BY created_at, id"
+    "SELECT id, name, url, origin_host, subtitle, tag, online_at, online_version " +
+      "FROM engines ORDER BY created_at, id"
   ).all();
   const rows = Array.isArray(results) ? results : [];
   caches.set(env.DB, { at: Date.now(), rows });
   return rows;
 }
 
-/// Marks each engine with whether its own tunnel answers right now.
-async function withHealth(rows, env) {
-  const probes = rows.map(async (row) => {
-    const base = origin(row);
-    if (!base) return { ...row, online: false };
-    try {
-      const response = await fetch(`${base}/healthz`, {
-        headers: { ...tokenHeaders(env), accept: "application/json" },
-        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-      });
-      if (!response.ok) return { ...row, online: false };
-      const body = await response.json().catch(() => null);
-      if (!body || body.ok !== true) return { ...row, online: false };
-      return { ...row, online: true, version: body.version || "" };
-    } catch {
-      return { ...row, online: false };
-    }
-  });
-  return Promise.all(probes);
+/// The engines. Answers from this isolate's copy while it is fresh, and refreshes
+/// it in the background once it is not — a client never pays for the read twice.
+async function engines(env, ctx) {
+  const cache = remembered(env);
+  const age = cache ? Date.now() - cache.at : Infinity;
+  if (cache && age < ROWS_TTL_MS) return cache.rows;
+  if (cache) {
+    after(ctx, readRows(env).catch(() => {}));
+    return cache.rows;
+  }
+  return readRows(env);
 }
 
 function origin(row) {
@@ -75,6 +91,64 @@ function tokenHeaders(env) {
   const id = String(env.ACCESS_CLIENT_ID || "");
   const secret = String(env.ACCESS_CLIENT_SECRET || "");
   return id && secret ? { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret } : {};
+}
+
+/// One engine's address, as the response shows it.
+function isOnline(row, now) {
+  const stamp = Number(row.online_at || 0) * 1000;
+  return stamp > 0 && now - stamp < ONLINE_WINDOW_MS;
+}
+
+/// Probes every engine that has no fresh stamp, all at once, and writes the
+/// answers straight back to the table the next request reads.
+async function refreshHealth(env, rows, now) {
+  const stale = rows.filter((row) => {
+    if (!origin(row)) return false;
+    const stamp = Number(row.online_at || 0) * 1000;
+    return stamp === 0 || now - stamp > PROBE_AFTER_MS;
+  });
+  if (stale.length === 0) return;
+
+  const headers = tokenHeaders(env);
+  const answers = await Promise.all(
+    stale.map(async (row) => {
+      try {
+        const response = await fetch(`${origin(row)}/healthz`, {
+          headers: { ...headers, accept: "application/json" },
+          signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+        });
+        if (!response.ok) return { id: row.id, online: false };
+        const body = await response.json().catch(() => null);
+        if (!body || body.ok !== true) return { id: row.id, online: false };
+        return { id: row.id, online: true, version: String(body.version || "") };
+      } catch {
+        return { id: row.id, online: false };
+      }
+    })
+  );
+
+  const stamp = Math.floor(Date.now() / 1000);
+  const statements = answers.map((answer) =>
+    env.DB.prepare("UPDATE engines SET online_at = ?1, online_version = ?2 WHERE id = ?3").bind(
+      answer.online ? stamp : 0,
+      answer.version || "",
+      answer.id
+    )
+  );
+  if (statements.length === 0) return;
+
+  // One round trip for every row, not one per row.
+  if (typeof env.DB.batch === "function") await env.DB.batch(statements);
+  else for (const statement of statements) await statement.run();
+
+  const cache = remembered(env);
+  if (!cache) return;
+  for (const answer of answers) {
+    const row = cache.rows.find((item) => item.id === answer.id);
+    if (!row) continue;
+    row.online_at = answer.online ? stamp : 0;
+    row.online_version = answer.version || "";
+  }
 }
 
 async function forward(request, row, env) {
@@ -103,7 +177,7 @@ async function forward(request, row, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (!env.DB) return error(503, "The engine registry is not configured");
 
     const url = new URL(request.url);
@@ -118,13 +192,34 @@ export default {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return error(405, "The registry is read-only");
       }
-      const rows = await withHealth(await engines(env), env);
-      return json(200, { engines: rows });
+      let rows;
+      try {
+        rows = await engines(env, ctx);
+      } catch {
+        return error(503, "The engine registry is unavailable");
+      }
+      const now = Date.now();
+      // Answer from the stamps that are already there, then go and refresh them.
+      const answer = rows.map((row) => {
+        const online = isOnline(row, now);
+        return {
+          id: row.id,
+          name: row.name,
+          url: row.url,
+          origin_host: row.origin_host,
+          subtitle: row.subtitle,
+          tag: row.tag,
+          online,
+          version: online ? row.online_version || "" : ""
+        };
+      });
+      if (rows.some((row) => origin(row))) after(ctx, refreshHealth(env, rows, now));
+      return json(200, { engines: answer });
     }
 
     let rows;
     try {
-      rows = await engines(env);
+      rows = await engines(env, ctx);
     } catch {
       return error(503, "The engine registry is unavailable");
     }
@@ -133,7 +228,6 @@ export default {
     // A name in the path is an engine; anything else is the first engine, which
     // is what a client that only knows the hostname expects.
     const named = rows.find((row) => row.id === first);
-    const chosen = named || rows[0];
-    return forward(request, chosen, env);
+    return forward(request, named || rows[0], env);
   }
 };
