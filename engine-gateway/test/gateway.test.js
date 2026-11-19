@@ -53,6 +53,50 @@ const rows = [
   }
 ];
 
+/// Response for a token hash lookup, or null for an unknown token.
+async function hashToken(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/// A D1 stand-in that answers both the registry and the token table, so a test
+/// can decide which bearer the gateway vouches for.
+function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
+  const list = source.map((row) => ({ ...row }));
+  const queries = [];
+  return {
+    queries,
+    prepare(sql) {
+      if (/FROM auth_tokens WHERE token_hash/i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(tokenHash) {
+            return {
+              async first() {
+                if (tokenQueryFails) throw new Error("D1 unavailable");
+                const row = tokens.find((t) => t.token_hash === tokenHash);
+                return row ? { state: row.state, expires_at: row.expires_at ?? null } : null;
+              }
+            };
+          }
+        };
+      }
+      if (!/FROM engines ORDER BY/i.test(sql)) throw new Error(`unexpected query: ${sql}`);
+      queries.push(sql);
+      return {
+        async all() {
+          return {
+            results: list.map((row) => ({
+              ...row,
+              online: row.heartbeat_at > 0 && Math.floor(Date.now() / 1000) - row.heartbeat_at <= 60 ? 1 : 0
+            }))
+          };
+        }
+      };
+    }
+  };
+}
+
 const env = {
   ACCESS_CLIENT_ID: "id.access",
   ACCESS_CLIENT_SECRET: "secret"
@@ -193,4 +237,93 @@ test("nothing is registered means nothing is forwarded", async () => {
     db: registry([])
   });
   assert.equal(response.status, 503);
+});
+// ------------------------------------------------------------ bearer gate
+// The gateway shares D1 with the auth Worker. It refuses any bearer the Worker
+// does not vouch for, so a master token dies here even if an old engine behind
+// the tunnel would still accept it.
+
+const GOOD = "worker-issued-token";
+const MASTER = "the-engine-master-token";
+
+async function activeTokens(extra = []) {
+  return [
+    { token_hash: await hashToken(GOOD), state: "active", expires_at: null },
+    ...extra
+  ];
+}
+
+const authed = (path, token) =>
+  new Request(`https://engine.aixodia.dpdns.org${path}`, {
+    headers: { authorization: `Bearer ${token}` }
+  });
+
+test("a Worker-issued bearer is forwarded to the engine", async () => {
+  const { response, calls } = await run(authed("/api/sessions", GOOD), {
+    db: data({ tokens: await activeTokens() })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1, "the request reached the engine");
+  assert.equal(calls[0].init.headers.get("authorization"), `Bearer ${GOOD}`);
+});
+
+test("the master token is refused at the door, never reaching an engine", async () => {
+  const { response, calls } = await run(authed("/api/sessions", MASTER), {
+    db: data({ tokens: await activeTokens() })
+  });
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).code, "UNKNOWN_TOKEN");
+  assert.equal(calls.length, 0, "nothing was forwarded to the old engine");
+});
+
+test("a revoked token is refused on the next request", async () => {
+  // The Worker flipped the row to revoked; the gateway reads the same table.
+  const revoked = data({ tokens: [{ token_hash: await hashToken(GOOD), state: "revoked", expires_at: null }] });
+  const { response, calls } = await run(authed("/api/sessions", GOOD), { db: revoked });
+  assert.equal(response.status, 401);
+  assert.equal(calls.length, 0);
+});
+
+test("an expired token is refused", async () => {
+  const past = Math.floor(Date.now() / 1000) - 10;
+  const { response } = await run(authed("/api/sessions", GOOD), {
+    db: data({ tokens: [{ token_hash: await hashToken(GOOD), state: "active", expires_at: past }] })
+  });
+  assert.equal(response.status, 401);
+});
+
+test("a token that has not expired yet passes", async () => {
+  const future = Math.floor(Date.now() / 1000) + 600;
+  const { response } = await run(authed("/api/sessions", GOOD), {
+    db: data({ tokens: [{ token_hash: await hashToken(GOOD), state: "active", expires_at: future }] })
+  });
+  assert.equal(response.status, 200);
+});
+
+test("no bearer means no token check — probes and tickets still pass", async () => {
+  const { response, calls } = await run(new Request("https://engine.aixodia.dpdns.org/healthz"), {
+    db: data({ tokens: [] })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    data({ tokens: [] }).queries.filter((q) => /auth_tokens/.test(q)).length,
+    0,
+    "no token query was made"
+  );
+});
+
+test("the registry is public even if a bad bearer is attached", async () => {
+  const { response } = await run(authed("/api/engines", MASTER), {
+    db: data({ tokens: [] })
+  });
+  assert.equal(response.status, 200, "the registry branch precedes the token check");
+});
+
+test("a broken token store fails closed, not open", async () => {
+  const { response, calls } = await run(authed("/api/sessions", GOOD), {
+    db: data({ tokens: [], tokenQueryFails: true })
+  });
+  assert.equal(response.status, 503);
+  assert.equal(calls.length, 0);
 });

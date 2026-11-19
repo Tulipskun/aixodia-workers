@@ -52,6 +52,44 @@ function tokenHeaders(env) {
   return id && secret ? { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret } : {};
 }
 
+const tokenEncoder = new TextEncoder();
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", tokenEncoder.encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function bearer(req) {
+  const match = (req.headers.get("authorization") || "").match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+/// Check a bearer against the one table the auth Worker issues from.
+///
+/// Both Workers bind the same D1 database, so the live token set is local to
+/// this Worker — no round trip, and a revoke takes effect on the next request.
+/// This matters because the engine behind the tunnel may be an older build that
+/// still honours the master token: refusing an unknown bearer here, at the only
+/// public entrance, means that credential never reaches any engine.
+///
+/// Returns "yes" / "no" / "unavailable"; the last is a D1 fault, kept distinct
+/// from a token the Worker simply does not vouch for.
+async function bearerVerdict(env, token) {
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT state, expires_at FROM auth_tokens WHERE token_hash = ?1"
+    ).bind(await sha256Hex(token)).first();
+  } catch {
+    return "unavailable";
+  }
+  if (!row || row.state !== "active") return "no";
+  if (typeof row.expires_at === "number" && row.expires_at <= Math.floor(Date.now() / 1000)) {
+    return "no";
+  }
+  return "yes";
+}
+
 /// The engines with their lease read out, newest registration last.
 async function engines(env) {
   const { results } = await env.DB.prepare(
@@ -134,6 +172,18 @@ export default {
       } catch {
         return error(503, "The engine registry is unavailable");
       }
+    }
+
+    // A bearer is a claim, not a credential until the auth Worker vouches for
+    // it. Check it here rather than trusting the engine to refuse it: an older
+    // engine behind the tunnel may still accept its own master token, and this
+    // Worker is the only public entrance to every engine. Requests without a
+    // bearer (health probes, the registry, socket tickets) are untouched.
+    const claimed = bearer(request);
+    if (claimed) {
+      const verdict = await bearerVerdict(env, claimed);
+      if (verdict === "unavailable") return error(503, "The token store is unavailable");
+      if (verdict === "no") return json(401, { error: "unauthorized", code: "UNKNOWN_TOKEN" });
     }
 
     let rows;

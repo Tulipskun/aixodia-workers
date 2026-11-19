@@ -48,6 +48,20 @@ else. What this Worker does with a request:
 The path is forwarded as-is because the engine takes its own name off before it
 routes — the Worker does not strip anything, so one rewrite exists, not two.
 
+### The bearer is checked here, not left to the engine
+
+Any request carrying `Authorization: Bearer …` is first checked against the
+`auth_tokens` table in the shared D1 — the same table the auth Worker issues
+from. An unknown, revoked or expired token gets 401 here and is never forwarded;
+an unavailable token store fails closed (503). Requests with no bearer — health
+probes, the registry, WebSocket tickets — are unaffected.
+
+This is the only public entrance to every engine, so it is the reliable place to
+refuse a credential the Worker did not issue, including the engine's own master
+token. An engine behind the tunnel may still be running an older build that
+would accept that token; checking here means it never gets the chance. Revoking
+a token in the Worker takes effect on the next request, with no cache to drain.
+
 Forwarding uses the engine's `origin_host`, never its `url`: the `url` is the
 public address (this hostname), and fetching that from here would come straight
 back to this Worker. Each origin hostname has an Access application whose only
