@@ -20,5 +20,9 @@ CREATE TABLE IF NOT EXISTS engines (
   -- nobody has heard from for a lease length is offline. The gateway only reads
   -- it — no cron, no probe, nothing on the way to an answer.
   heartbeat_at INTEGER NOT NULL DEFAULT 0,
-  version      TEXT NOT NULL DEFAULT ''
+  version      TEXT NOT NULL DEFAULT '',
+  -- One tunnel host has one owner. An engine writes its own random uid here;
+  -- a second live process with a different uid is refused, so two cloned
+  -- machines cannot silently share one row and make the gateway's route flap.
+  instance_uid TEXT NOT NULL DEFAULT ''
 );

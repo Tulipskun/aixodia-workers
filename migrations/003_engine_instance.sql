@@ -1,0 +1,19 @@
+-- One tunnel host must have exactly one live engine.
+--
+-- Two machines cloned from the same image share a machine id, which means the
+-- same KV keys, the same Named Tunnel and the same origin_host. Both then find
+-- the single `engines` row for that host and both start serving it; the gateway
+-- sees one online row while the tunnel balances connections across the two
+-- connectors. The symptom is a health check that flips between two pids and a
+-- credential that is accepted on one request and refused on the next.
+--
+-- `instance_uid` is drawn by each engine from the OS RNG on first start and kept
+-- in its state directory. It is written onto the row the engine owns. A second
+-- live process with a different uid is then refused at startup instead of
+-- silently sharing the row; a restart of the same machine keeps its uid and
+-- reclaims its own row. Old rows keep the empty default and are claimed once by
+-- the next upgrade.
+--
+-- Applied once, by hand:
+--   npx wrangler d1 execute aixodia --remote --file=migrations/003_engine_instance.sql
+ALTER TABLE engines ADD COLUMN instance_uid TEXT NOT NULL DEFAULT '';
