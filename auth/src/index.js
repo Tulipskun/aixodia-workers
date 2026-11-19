@@ -20,8 +20,7 @@
  *                    could be refused right after being created.
  */
 
-const SESSION_PREFIX = ''
-const ACTIVE_TTL_SECS = 720 * 60 * 60
+const TOKEN_TTL_SECS = 720 * 60 * 60   // browser tokens have a client-side refresh hint
 const EMAIL_MAX = 254
 
 import * as device from './device.js'
@@ -55,7 +54,6 @@ function randomReference() {
   crypto.getRandomValues(bytes)
   return base64url(bytes)
 }
-
 function base64url(bytes) {
   let binary = ''
   for (const b of bytes) binary += String.fromCharCode(b)
@@ -79,7 +77,7 @@ function now() {
  * request and makes a dump of the table useless.
  */
 async function tokenKey(token) {
-  return sha256Hex(SESSION_PREFIX + token)
+  return sha256Hex(token)
 }
 
 /** Deliberately loose: the allowlist decides, this only rejects nonsense. */
@@ -121,20 +119,19 @@ function ensureSchema(env) {
 }
 
 async function createSchema(env) {
+  // Every sign-in mints one token in one table. The browser route writes here
+  // too: there is no second session table whose tokens the engine cannot sync.
   await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS gate_sessions (
+    `CREATE TABLE IF NOT EXISTS auth_tokens (
        token_hash TEXT PRIMARY KEY NOT NULL,
        email TEXT NOT NULL,
-       reference TEXT NOT NULL,
+       device_name TEXT NOT NULL,
        state TEXT NOT NULL,
        created_at INTEGER NOT NULL,
-       confirm_by INTEGER NOT NULL,
-       expires_at INTEGER NOT NULL,
-       confirmed_by TEXT
+       expires_at INTEGER,
+       sync_state TEXT NOT NULL DEFAULT 'pending',
+       revoked_at INTEGER
      )`,
-  ).run()
-  await env.DB.prepare(
-    `CREATE UNIQUE INDEX IF NOT EXISTS gate_sessions_reference ON gate_sessions (reference)`,
   ).run()
   // Device Authorization Flow (auth_system.md): the app's sign-in attempts and
   // the live tokens. Tokens are hashed; device codes are hashed too, while the
@@ -155,17 +152,23 @@ async function createSchema(env) {
     `CREATE UNIQUE INDEX IF NOT EXISTS device_codes_user_code
      ON device_codes (user_code) WHERE state = 'pending'`,
   ).run()
+  // Deployments created before the browser and device flows were unified have
+  // an auth_tokens table without expires_at. Add it in place; the column is
+  // nullable, so every existing device token stays valid with no expiry.
+  await env.DB.prepare(`ALTER TABLE auth_tokens ADD COLUMN expires_at INTEGER`).run()
+    .catch((err) => {
+      if (!String(err?.message || err).includes('duplicate column')) throw err
+    })
+  // Tokens issued by the old browser route live in gate_sessions. Copy the
+  // live ones into the single table so a deploy does not sign the console out;
+  // the old rows are left untouched as a rollback record.
   await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS auth_tokens (
-       token_hash TEXT PRIMARY KEY NOT NULL,
-       email TEXT NOT NULL,
-       device_name TEXT NOT NULL,
-       state TEXT NOT NULL,
-       created_at INTEGER NOT NULL,
-       sync_state TEXT NOT NULL DEFAULT 'pending',
-       revoked_at INTEGER
-     )`,
-  ).run()
+    `INSERT OR IGNORE INTO auth_tokens
+       (token_hash, email, device_name, state, created_at, expires_at, sync_state, revoked_at)
+     SELECT token_hash, email, 'browser', 'active', created_at, expires_at, 'pending', NULL
+       FROM gate_sessions WHERE state = 'active'`,
+  ).run().catch(() => {}) // the table may not exist in a fresh deployment
+
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS rate_limits (
        key TEXT PRIMARY KEY NOT NULL,
@@ -176,19 +179,18 @@ async function createSchema(env) {
 }
 
 /**
- * The state a row reports right now.
+ * The state an auth-token row reports right now.
  *
- * Expiry is derived, never written. Sweeping on read would make every status poll
- * — which the app sends every couple of seconds — a D1 write, and a session table
- * that is written on read is the one pattern that turns a cheap poll into a
- * bottleneck. The stored state is what a human action set (pending, active,
- * revoked); whether it has run out of time is a function of the clock.
+ * Device-issued tokens have no expiry column value on purpose: the draft's rule
+ * is revoke-only. Browser-issued tokens carry `expires_at` so a console token
+ * cannot outlive its refresh hint if the console stops asking for a new one.
+ * Expiry is derived, never written: a status poll must not become a D1 write.
  */
 function effectiveState(row) {
   if (!row) return 'unknown'
-  if (row.state === 'pending') return row.confirm_by <= now() ? 'expired' : 'pending'
-  if (row.state === 'active') return row.expires_at <= now() ? 'expired' : 'active'
-  return row.state
+  if (row.state !== 'active') return row.state
+  if (typeof row.expires_at === 'number' && row.expires_at <= now()) return 'expired'
+  return 'active'
 }
 
 const EXPLAIN = {
@@ -311,7 +313,7 @@ async function verifySignature(assertion, header, teamDomain) {
  * answerable without the engine and without writing a session just to ask.
  */
 async function identity(env, req) {
-  const found = await accessIdentity(env, req)
+  const found = await hooks.accessIdentity(env, req)
   if (!found.email) {
     return json({ error: 'unauthorized', code: found.error?.toUpperCase() || 'NO_ACCESS_SESSION' }, 401)
   }
@@ -356,20 +358,19 @@ async function configValue(env, kvKey, varName) {
  * sides at once.
  */
 /**
- * Issues an engine token for the signed-in browser.
+ * Issues one engine token for the signed-in browser.
  *
  * The console runs on one host and the engine on another, so the Access cookie
  * that proves who the user is never reaches the engine. This route turns that
- * cookie into the bearer token the engine accepts: it reuses the caller's live
- * session when one matches this email, and otherwise mints one that is already
- * active, because reaching this route at all required a verified Access
- * assertion — the allowlist check below is the remaining gate.
+ * cookie into the same bearer token the app's device flow hands out: one table,
+ * one hash format, one push to the engines. Reaching this route at all required
+ * a verified Access assertion — the allowlist check below is the remaining gate.
  *
  * The email comes from the assertion, never from the request body, so a caller
  * cannot ask for someone else's token.
  */
 async function issueToken(env, req) {
-  const found = await accessIdentity(env, req)
+  const found = await hooks.accessIdentity(env, req)
   if (!found.email) {
     return json({ error: 'unauthorized', code: found.error?.toUpperCase() || 'NO_ACCESS_SESSION' }, 401)
   }
@@ -382,16 +383,19 @@ async function issueToken(env, req) {
 
   await ensureSchema(env)
 
-  // A live session can be reused, but its token is not stored in a readable
-  // form, so a fresh one is minted every time and the old row is left to expire.
+  // Every exchange mints a fresh opaque token: the old row stays until its
+  // refresh hint runs out, so a page reload cannot resurrect a revoked session.
   const token = randomToken()
-  const expiresAt = now() + ACTIVE_TTL_SECS
+  const tokenHash = await tokenKey(token)
+  const expiresAt = now() + TOKEN_TTL_SECS
   await env.DB.prepare(
-    `INSERT INTO gate_sessions (token_hash, email, reference, state, created_at, confirm_by, expires_at, confirmed_by)
-     VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5, ?2)`,
+    `INSERT INTO auth_tokens
+       (token_hash, email, device_name, state, created_at, expires_at, sync_state, revoked_at)
+     VALUES (?1, ?2, 'browser', 'active', ?3, ?4, 'pending', NULL)`,
   )
-    .bind(await tokenKey(token), email, randomReference(), now(), expiresAt)
+    .bind(tokenHash, email, now(), expiresAt)
     .run()
+  await device.pushSync(env, { activate: [tokenHash] })
 
   return json({ token, email, expires_at: expiresAt })
 }
@@ -404,16 +408,20 @@ async function verify(env, req) {
 
   await ensureSchema(env)
 
+  // One token table for every client. The device flow writes here and so does
+  // the browser exchange, so a token the engine synced is a token this worker
+  // can vouch for — no second session store to keep in step.
+  const hash = await tokenKey(token)
   const row = await env.DB.prepare(
-    `SELECT state, email, expires_at FROM gate_sessions WHERE token_hash = ?1`,
+    `SELECT state, email, expires_at FROM auth_tokens WHERE token_hash = ?1`,
   )
-    .bind(await tokenKey(token))
+    .bind(hash)
     .first()
 
-  if (!row) return json({ valid: false, code: 'unknown_token' }, 401)
   const state = effectiveState(row)
+  if (!row || state === 'unknown') return json({ valid: false, code: 'unknown_token' }, 401)
   if (state === 'pending') return json({ valid: false, code: 'pending_confirmation' }, 403)
-  if (state !== 'active') return json({ valid: false, code: 'expired' }, 401)
+  if (state === 'expired') return json({ valid: false, code: 'expired' }, 401)
   return json({ valid: true, email: row.email, expires_at: row.expires_at })
 }
 

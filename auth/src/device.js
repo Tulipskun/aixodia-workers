@@ -318,9 +318,12 @@ export async function revoke(env, req) {
  */
 export async function activeSessions(env, req) {
   if (!(await syncSecretOk(env, req))) return json({ error: 'forbidden', code: 'BAD_SYNC_SECRET' }, 403)
+  // An expired browser token is not active even before a human revokes it, and
+  // the engine's set must not keep a credential the worker would refuse.
   const rows = await env.DB.prepare(
-    `SELECT token_hash FROM auth_tokens WHERE state = 'active'`,
-  ).all()
+    `SELECT token_hash FROM auth_tokens
+      WHERE state = 'active' AND (expires_at IS NULL OR expires_at > ?1)`,
+  ).bind(now()).all()
   return json({ hashes: (rows.results || []).map((r) => r.token_hash) })
 }
 
@@ -344,7 +347,7 @@ export async function resolveEngineTargets(env) {
   return Array.from(urls)
 }
 
-async function pushSync(env, body) {
+export async function pushSync(env, body) {
   const targets = await resolveEngineTargets(env)
   if (targets.length === 0) return
   const secret = await syncSecret(env)

@@ -76,6 +76,7 @@ CREATE TABLE auth_tokens (
   device_name TEXT NOT NULL,
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  expires_at INTEGER,
   sync_state TEXT NOT NULL DEFAULT 'pending',
   revoked_at INTEGER
 );
