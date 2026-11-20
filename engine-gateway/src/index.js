@@ -27,6 +27,19 @@
 //! beating is offline; the app's own socket decides whether the engine it is on
 //! can be reached right now.
 
+/// The browser origins allowed to call this hostname from a page.
+///
+/// CORS belongs to this Worker and not to the origins behind it. Cloudflare
+/// Access sits in front of every origin with a service-token policy, and it
+/// answers a request that carries an `Origin` header with a bare `403` — before
+/// the tunnel is even dialled. So the browser's `Origin` never travels further
+/// in: the preflight is answered here, and the actual request is forwarded
+/// without it. Without this a ticket POST from the console failed its preflight
+/// and no socket was ever opened.
+const DEFAULT_CONSOLE_ORIGINS = "https://aixodia.dpdns.org,http://localhost:5173";
+
+const ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS";
+
 /// How long a heartbeat keeps an engine online. Three beats: one lost write is
 /// not a death, two in a row is.
 const LEASE_SECONDS = 60;
@@ -34,6 +47,34 @@ const LEASE_SECONDS = 60;
 /// How long this isolate may reuse the rows it forwards to. Engines are added
 /// and renamed by hand, so a few seconds of staleness costs nothing.
 const ROUTE_CACHE_MS = 10_000;
+
+function consoleOrigins(env) {
+  return String(env.CONSOLE_ORIGINS || DEFAULT_CONSOLE_ORIGINS)
+    .split(",")
+    .map((value) => value.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+}
+
+/// The origin a reply may be read from, or `""` when the caller is not a page.
+function allowedOrigin(request, env) {
+  const origin = request.headers.get("origin");
+  return origin && consoleOrigins(env).includes(origin) ? origin : "";
+}
+
+/// A preflight, answered without touching an engine: the origins behind this
+/// hostname refuse browser origins outright, so a forwarded OPTIONS would come
+/// back 403 and the browser would never send the request it was asking about.
+function preflight(request, origin) {
+  const headers = new Headers({
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": ALLOWED_METHODS,
+    "access-control-max-age": "600",
+    vary: "Origin"
+  });
+  const asked = request.headers.get("access-control-request-headers");
+  if (asked) headers.set("access-control-allow-headers", asked);
+  return new Response(null, { status: 204, headers });
+}
 
 function json(status, body) {
   return new Response(JSON.stringify(body), {
@@ -135,19 +176,29 @@ async function forward(request, row, env) {
 
   const headers = new Headers(request.headers);
   headers.delete("host");
+  // Access answers a browser origin with 403, and the caller here is this
+  // Worker, not the page: the page's CORS is settled below, on the way out.
+  headers.delete("origin");
+  headers.delete("referer");
   for (const [name, value] of Object.entries(tokenHeaders(env))) headers.set(name, value);
 
   const init = { method: request.method, headers, redirect: "manual" };
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
 
   const response = await fetch(target.toString(), init);
+  const caller = allowedOrigin(request, env);
   // A WebSocket answer has to be handed back untouched: wrapping it would drop
   // the upgrade. Everything else can be re-wrapped to keep the body streaming.
   if (response.webSocket || response.status === 101) return response;
+  const echoed = new Headers(response.headers);
+  if (caller) {
+    echoed.set("access-control-allow-origin", caller);
+    echoed.set("vary", "Origin");
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers
+    headers: echoed
   });
 }
 
@@ -172,6 +223,14 @@ export default {
       } catch {
         return error(503, "The engine registry is unavailable");
       }
+    }
+
+    // A preflight is about this hostname, not about an engine: answer it here
+    // so the real request can be forwarded on its own terms.
+    if (request.method === "OPTIONS") {
+      const origin = allowedOrigin(request, env);
+      if (!origin) return error(403, "This origin is not allowed to call the gateway");
+      return preflight(request, origin);
     }
 
     // A bearer is a claim, not a credential until the auth Worker vouches for

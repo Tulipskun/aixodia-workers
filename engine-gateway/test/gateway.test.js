@@ -327,3 +327,71 @@ test("a broken token store fails closed, not open", async () => {
   assert.equal(response.status, 503);
   assert.equal(calls.length, 0);
 });
+
+test("a preflight is answered here, never forwarded to an Access-guarded origin", async () => {
+  const db = registry(rows);
+  let forwarded = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    forwarded += 1;
+    return new Response("should not be reached", { status: 500 });
+  };
+  try {
+    const request = new Request("https://engine.aixodia.dpdns.org/m-8a7d1192/api/terminals/ticket", {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://aixodia.dpdns.org",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization,content-type"
+      }
+    });
+    const response = await worker.fetch(request, { DB: db });
+    assert.equal(response.status, 204);
+    assert.equal(forwarded, 0);
+    assert.equal(response.headers.get("access-control-allow-origin"), "https://aixodia.dpdns.org");
+    assert.match(response.headers.get("access-control-allow-methods"), /POST/);
+    assert.match(response.headers.get("access-control-allow-headers"), /authorization/i);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a page from another origin is refused, and so is a preflight without one", async () => {
+  const db = registry(rows);
+  const stranger = await worker.fetch(
+    new Request("https://engine.aixodia.dpdns.org/m-8a7d1192/api/terminals", {
+      method: "OPTIONS",
+      headers: { origin: "https://evil.example" }
+    }),
+    { DB: db }
+  );
+  assert.equal(stranger.status, 403);
+  const bare = await worker.fetch(
+    new Request("https://engine.aixodia.dpdns.org/m-8a7d1192/api/terminals", { method: "OPTIONS" }),
+    { DB: db }
+  );
+  assert.equal(bare.status, 403);
+});
+
+test("a forward drops the page's origin, so Access cannot refuse it", async () => {
+  const db = registry(rows);
+  let seen = null;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen = { url: String(url), headers: new Headers(init.headers) };
+    return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://engine.aixodia.dpdns.org/m-8a7d1192/api/terminals", {
+        headers: { origin: "https://aixodia.dpdns.org", referer: "https://aixodia.dpdns.org/" }
+      }),
+      { DB: db }
+    );
+    assert.equal(seen.headers.get("origin"), null);
+    assert.equal(seen.headers.get("referer"), null);
+    assert.equal(response.headers.get("access-control-allow-origin"), "https://aixodia.dpdns.org");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

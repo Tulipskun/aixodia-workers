@@ -17,6 +17,11 @@ database_id = "e8e746ea-691e-43bf-9fe2-c4e4016f29a1"
 pattern = "engine.aixodia.dpdns.org/*"
 zone_name = "aixodia.dpdns.org"
 
+# The pages allowed to call this hostname from a browser. CORS is answered here
+# because the origins behind Access refuse a request that carries an `Origin`.
+[vars]
+CONSOLE_ORIGINS = "https://aixodia.dpdns.org,http://localhost:5173"
+
 # The hop that costs the most is this Worker to the engine's tunnel origin, not
 # the client to this Worker: the origin is one machine, the clients are anywhere.
 # Smart Placement puts the Worker next to whatever the requests keep talking to.
