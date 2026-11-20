@@ -87,14 +87,16 @@ test('a browser token verifies through the same endpoint a device token uses', a
 test('the sign-in hop redirects into the console', async () => {
   const res = await call('/auth/start')
   assert.equal(res.status, 302)
-  assert.equal(res.headers.get('location'), '/')
+  assert.equal(res.headers.get('location'), 'https://aixodia.dpdns.org/')
 })
 
-test('the sign-in hop only redirects within this origin', async () => {
+// The Location has to name the console, because a relative one is resolved against
+// the Worker's own origin and would land the browser on workers.dev.
+test('the sign-in hop only redirects within the console', async () => {
   const inside = await call('/auth/start?next=/engines')
-  assert.equal(inside.headers.get('location'), '/engines')
+  assert.equal(inside.headers.get('location'), 'https://aixodia.dpdns.org/engines')
   const outside = await call('/auth/start?next=https://evil.example/steal')
-  assert.equal(outside.headers.get('location'), '/')
+  assert.equal(outside.headers.get('location'), 'https://aixodia.dpdns.org/')
   const protocolRelative = await call('/auth/start?next=//evil.example/steal')
-  assert.equal(protocolRelative.headers.get('location'), '/')
+  assert.equal(protocolRelative.headers.get('location'), 'https://aixodia.dpdns.org/')
 })

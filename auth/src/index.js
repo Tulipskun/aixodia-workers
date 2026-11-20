@@ -442,10 +442,20 @@ function bearer(req) {
  * Only a path on this origin is honoured. An absolute URL would let this endpoint
  * point a freshly authenticated browser somewhere else entirely.
  */
-function startRedirect(url) {
+function startRedirect(url, env = {}) {
   const next = String(url.searchParams.get('next') || '/')
   const safe = next.startsWith('/') && !next.startsWith('//') ? next : '/'
-  return new Response(null, { status: 302, headers: { location: safe } })
+  /* The Location is absolute against the public console, not against whatever host
+     reached this Worker: a relative one is resolved against the Worker's own origin
+     and would carry the browser to workers.dev instead of the console. */
+  let base = 'https://aixodia.dpdns.org'
+  try {
+    const configured = String(env.PUBLIC_URL || '').trim()
+    if (configured) base = configured
+  } catch {
+    /* a missing variable must not become a redirect into nowhere */
+  }
+  return new Response(null, { status: 302, headers: { location: new URL(safe, base).toString() } })
 }
 
 // ---------------------------------------------------------------- routing
@@ -483,7 +493,7 @@ export default {
       else if (path === '/healthz') response = json({ ok: true })
       else if (method === 'GET' && path === '/auth/identity') response = await identity(env, req)
       else if (method === 'POST' && path === '/auth/token') response = await issueToken(env, req)
-      else if (method === 'GET' && path === '/auth/start') response = startRedirect(url)
+      else if (method === 'GET' && path === '/auth/start') response = startRedirect(url, env)
 
       else response = json({ error: 'not_found' }, 404)
     } catch (err) {
