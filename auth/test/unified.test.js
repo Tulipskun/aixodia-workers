@@ -80,3 +80,21 @@ test('a browser token verifies through the same endpoint a device token uses', a
   assert.equal(bad.status, 401)
   assert.equal((await bad.json()).code, 'unknown_token')
 })
+
+// Signing in from the console means passing through Cloudflare Access at
+// /auth/start. The browser comes back to this path with a session, so the answer
+// has to send it into the console rather than leave it on a blank page.
+test('the sign-in hop redirects into the console', async () => {
+  const res = await call('/auth/start')
+  assert.equal(res.status, 302)
+  assert.equal(res.headers.get('location'), '/')
+})
+
+test('the sign-in hop only redirects within this origin', async () => {
+  const inside = await call('/auth/start?next=/engines')
+  assert.equal(inside.headers.get('location'), '/engines')
+  const outside = await call('/auth/start?next=https://evil.example/steal')
+  assert.equal(outside.headers.get('location'), '/')
+  const protocolRelative = await call('/auth/start?next=//evil.example/steal')
+  assert.equal(protocolRelative.headers.get('location'), '/')
+})

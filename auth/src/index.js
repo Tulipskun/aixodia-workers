@@ -431,6 +431,23 @@ function bearer(req) {
   return match ? match[1].trim() : ''
 }
 
+/**
+ * Where a browser goes after Cloudflare Access has let it through.
+ *
+ * This endpoint exists to be intercepted: a browser with no Access session is sent
+ * to the login and comes back here with one. Coming back is the whole point, so the
+ * answer has to move the browser on — an empty 200/204 leaves it staring at a blank
+ * page, which from the outside is indistinguishable from a sign-in that failed.
+ *
+ * Only a path on this origin is honoured. An absolute URL would let this endpoint
+ * point a freshly authenticated browser somewhere else entirely.
+ */
+function startRedirect(url) {
+  const next = String(url.searchParams.get('next') || '/')
+  const safe = next.startsWith('/') && !next.startsWith('//') ? next : '/'
+  return new Response(null, { status: 302, headers: { location: safe } })
+}
+
 // ---------------------------------------------------------------- routing
 
 export default {
@@ -466,13 +483,7 @@ export default {
       else if (path === '/healthz') response = json({ ok: true })
       else if (method === 'GET' && path === '/auth/identity') response = await identity(env, req)
       else if (method === 'POST' && path === '/auth/token') response = await issueToken(env, req)
-      else if (method === 'GET' && path === '/auth/start') {
-        // The place Cloudflare Access intercepts. A browser sent here without a
-        // session is redirected to the login and comes back with one; with a
-        // session it lands here, so answering 204 gives it nothing to parse and
-        // nothing to get stuck on.
-        response = new Response(null, { status: 204 })
-      }
+      else if (method === 'GET' && path === '/auth/start') response = startRedirect(url)
 
       else response = json({ error: 'not_found' }, 404)
     } catch (err) {
