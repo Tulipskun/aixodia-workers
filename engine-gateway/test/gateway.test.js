@@ -81,6 +81,53 @@ function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
           }
         };
       }
+      if (/^DELETE FROM engines/i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(id) {
+            return {
+              async run() {
+                const at = list.findIndex((r) => r.id === id);
+                const fresh = at >= 0 && list[at].heartbeat_at > 0 &&
+                  Math.floor(Date.now() / 1000) - list[at].heartbeat_at <= 60;
+                if (at < 0 || fresh) return { meta: { changes: 0 } };
+                list.splice(at, 1);
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+      if (/^UPDATE engines SET alias/i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(alias, id) {
+            return {
+              async run() {
+                const row = list.find((r) => r.id === id);
+                if (!row) return { meta: { changes: 0 } };
+                row.alias = alias;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+      if (/FROM engines WHERE id = /i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(id) {
+            return {
+              async first() {
+                const row = list.find((r) => r.id === id);
+                if (!row) return null;
+                const fresh = row.heartbeat_at > 0 && Math.floor(Date.now() / 1000) - row.heartbeat_at <= 60;
+                return { id: row.id, name: row.name, alias: row.alias || "", online: fresh ? 1 : 0 };
+              }
+            };
+          }
+        };
+      }
       if (!/FROM engines ORDER BY/i.test(sql)) throw new Error(`unexpected query: ${sql}`);
       queries.push(sql);
       return {
@@ -394,4 +441,134 @@ test("a forward drops the page's origin, so Access cannot refuse it", async () =
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// --------------------------------------------------- deleting and renaming
+// Two writes a person makes about a machine, rather than a machine making about
+// itself. Both need a bearer, and both are about a row, not about a forward.
+
+const rowHandle = () => new Request("https://engine.aixodia.dpdns.org/api/engines/work-1", {
+  method: "DELETE",
+  headers: { authorization: `Bearer ${GOOD}` }
+});
+
+const renameHandle = (body, id = "work-1") =>
+  new Request(`https://engine.aixodia.dpdns.org/api/engines/${id}`, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${GOOD}`, "content-type": "application/json" },
+    body: typeof body === "string" ? body : JSON.stringify(body)
+  });
+
+test("an engine that stopped beating is deleted, and nothing is forwarded", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const { response, calls } = await run(rowHandle(), { db });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, deleted: "work-1", name: "Work" });
+  assert.equal(calls.length, 0, "a delete is a registry write, not a forward");
+});
+
+test("a live engine is refused, because its own heartbeat would undo the delete", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const request = new Request("https://engine.aixodia.dpdns.org/api/engines/m-8a7d1192", {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${GOOD}` }
+  });
+  const { response } = await run(request, { db });
+  assert.equal(response.status, 409);
+  const body = await response.json();
+  assert.equal(body.code, "ENGINE_ONLINE");
+  assert.match(body.error, /still beating/);
+});
+
+test("an engine nobody has heard of is a 404, not a silent success", async () => {
+  const { response } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/engines/m-ghost", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${GOOD}` }
+    }),
+    { db: data({ tokens: await activeTokens() }) }
+  );
+  assert.equal(response.status, 404);
+});
+
+test("deleting without a bearer is refused, and no row is touched", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const { response } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/engines/work-1", { method: "DELETE" }),
+    { db }
+  );
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).code, "NO_TOKEN");
+  assert.equal(db.queries.filter((q) => /^DELETE FROM engines/.test(q)).length, 0);
+});
+
+test("a bearer the store does not vouch for cannot delete", async () => {
+  const { response } = await run(rowHandle(), { db: data({ tokens: [] }) });
+  assert.equal(response.status, 401);
+});
+
+test("an alias is stored beside the id, never instead of it", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const { response } = await run(renameHandle({ alias: "Work bench" }), { db });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, id: "work-1", alias: "Work bench", name: "Work" });
+});
+
+test("the registry carries the alias so a client can draw the name a person chose", async () => {
+  const db = data({ tokens: await activeTokens(), source: [{ ...rows[1], alias: "Work bench" }] });
+  await run(renameHandle({ alias: "Work bench" }), { db });
+  const body = await (await run(registryRequest(), { db })).response.json();
+  assert.equal(body.engines[0].id, "work-1", "the address is still the machine's own");
+  assert.equal(body.engines[0].alias, "Work bench");
+});
+
+test("an empty alias clears the name, and the id is shown again", async () => {
+  const db = data({ tokens: await activeTokens(), source: [{ ...rows[1], alias: "Work bench" }] });
+  const { response } = await run(renameHandle({ alias: "  " }), { db });
+  assert.equal((await response.json()).alias, "");
+});
+
+test("a name is trimmed, stripped of control characters and bounded", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const { response } = await run(renameHandle({ alias: "  a\u0000b  " }), { db });
+  assert.equal((await response.json()).alias, "ab");
+  const long = data({ tokens: await activeTokens() });
+  const bounded = await run(renameHandle({ alias: "x".repeat(200) }), { db: long });
+  assert.equal((await bounded.response.json()).alias.length, 40);
+});
+
+test("a rename with no alias field is refused, because silence cannot mean 'clear it'", async () => {
+  const { response } = await run(renameHandle({ name: "Work" }), {
+    db: data({ tokens: await activeTokens() })
+  });
+  assert.equal(response.status, 400);
+});
+
+test("a rename needs a bearer too", async () => {
+  const { response } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/engines/work-1", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ alias: "Work bench" })
+    }),
+    { db: data({ tokens: await activeTokens() }) }
+  );
+  assert.equal(response.status, 401);
+});
+
+test("a row that is not in the registry cannot be named", async () => {
+  const { response } = await run(renameHandle({ alias: "Ghost" }, "m-ghost"), {
+    db: data({ tokens: await activeTokens() })
+  });
+  assert.equal(response.status, 404);
+});
+
+test("one engine row answers nothing but its two writes", async () => {
+  const { response } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/engines/work-1", {
+      headers: { authorization: `Bearer ${GOOD}` }
+    }),
+    { db: data({ tokens: await activeTokens() }) }
+  );
+  assert.equal(response.status, 405);
 });

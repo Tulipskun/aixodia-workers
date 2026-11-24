@@ -42,6 +42,8 @@ else. What this Worker does with a request:
 | request | what happens |
 |---|---|
 | `GET /api/engines` | the registry above, from D1 |
+| `PATCH /api/engines/<id>` | sets `alias`, the name a person sees — the id never moves |
+| `DELETE /api/engines/<id>` | forgets an engine whose lease has lapsed |
 | `/<id>/…` where `<id>` is an engine | forwarded to that engine's `origin_host`, **path unchanged** |
 | anything else (`/healthz`, `/api/…`) | forwarded to the first engine, unchanged |
 
@@ -98,6 +100,33 @@ machine renamed in place keeps the row it already owns.
 The engine's tunnel hostname is the Worker's way in, not a client's way in: the
 address a client is handed always points at this hostname and the name path.
 
+## Naming a machine, and forgetting one
+
+Two writes a person makes about a machine, rather than a machine making about
+itself. Both need a bearer, checked against `auth_tokens` like every other
+request that claims to be somebody.
+
+**`PATCH /api/engines/<id>`** with `{"alias": "Work bench"}` sets the name the
+app draws. The id is not touched, and that is the whole point: `id` is the path
+segment every client, socket ticket and revocation already addresses, and the
+engine writes it from its machine id on every start. `alias` is the one column
+the engine never writes, so a heartbeat cannot overwrite it. An empty alias clears
+the name and the registry's `name` (the id) is drawn again. A name is trimmed,
+stripped of control characters and cut at 40 characters.
+
+**`DELETE /api/engines/<id>`** removes the row of an engine whose lease has
+lapsed. A live engine is refused with `409 ENGINE_ONLINE`, and not out of
+caution: it rewrites its own row every twenty seconds, so deleting a beating row
+would be undone within one beat while the caller was told it had worked. The
+delete repeats the lease test in its own `WHERE`, so a beat that lands between the
+read and the write is refused rather than quietly overwritten.
+
+What is *not* deleted here: the machine's Named Tunnel, its DNS record and its
+`instances/<id>/*` KV keys. Those belong to the machine and are made by it on
+first start; forgetting the registry row is this Worker's whole namespace. An
+engine that comes back re-registers itself, which is the behaviour a machine
+temporarily off the network needs.
+
 ## The registry is one table
 
 ```sql
@@ -108,6 +137,7 @@ CREATE TABLE engines (
   origin_host TEXT,                  -- the tunnel hostname that engine answers on
   subtitle    TEXT,
   tag         TEXT,
+  alias       TEXT NOT NULL DEFAULT '',  -- the name a person gave it; never the id
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
 );
@@ -115,12 +145,13 @@ CREATE TABLE engines (
 
 `schema.sql` in the repository root creates it and is idempotent.
 
-* `GET /api/engines` answers the registry — id, name, url, subtitle, tag, never
-  the tunnel hostname — so the console's engine switcher has one source of truth.
+* `GET /api/engines` answers the registry — id, name, alias, url, subtitle, tag,
+  never the tunnel hostname — so the console's engine switcher has one source of
+  truth. `alias` is what a person named the machine; empty means nobody has.
 * The sign-in Worker reads the same `url` column when it pushes a revocation to
   every engine, so a new engine is one row for every consumer.
-* Nothing else is read here. The engine writes its own row; this Worker only
-  lists.
+* Nothing else is read here. The engine writes its own row and this Worker lists
+  it; `alias` is the one column the Worker writes and the engine leaves alone.
 
 ## Why a registry instead of Workers KV
 

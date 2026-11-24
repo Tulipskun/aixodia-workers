@@ -6,10 +6,21 @@
 //!
 //! * `GET /api/engines` — the registry, read from D1, with each engine's lease
 //!   and version.
+//! * `DELETE /api/engines/<id>` — forget an engine that is not running any more.
+//! * `PATCH /api/engines/<id>` — set the name a person sees, without touching
+//!   the id everything else addresses the machine by.
 //! * `/<name>/…` — forwarded to that engine's own tunnel origin, which serves
 //!   the path itself (the engine takes its name off before routing).
 //! * anything else — forwarded to the first engine, unchanged. That keeps
 //!   `/healthz` and `/api/…` answers for a client built before the name path.
+//!
+//! ## The id is the machine's, the alias is the person's
+//!
+//! `id` is the path segment every client, socket ticket and revocation uses, and
+//! it is written by the engine itself from its machine id — so renaming an engine
+//! may never change it. `alias` is a column the engine never writes: the Worker
+//! owns it, and a heartbeat cannot overwrite it. An empty alias means the machine
+//! has no name of its own and the registry's `name` (the id) is shown instead.
 //!
 //! The origin hostnames are not public: each one has an Access application that
 //! admits the service token below and nothing else (`non_identity`), so this
@@ -38,7 +49,11 @@
 /// and no socket was ever opened.
 const DEFAULT_CONSOLE_ORIGINS = "https://aixodia.dpdns.org,http://localhost:5173";
 
-const ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS";
+const ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
+
+/// The longest name a person may give an engine. Long enough for a hostname and
+/// a purpose, short enough that a card can draw it without truncating.
+const ALIAS_MAX = 40;
 
 /// How long a heartbeat keeps an engine online. Three beats: one lost write is
 /// not a death, two in a row is.
@@ -134,13 +149,14 @@ async function bearerVerdict(env, token) {
 /// The engines with their lease read out, newest registration last.
 async function engines(env) {
   const { results } = await env.DB.prepare(
-    "SELECT id, name, url, origin_host, subtitle, tag, version, " +
+    "SELECT id, name, alias, url, origin_host, subtitle, tag, version, " +
       `(heartbeat_at > 0 AND unixepoch() - heartbeat_at <= ${LEASE_SECONDS}) AS online ` +
       "FROM engines ORDER BY created_at, id"
   ).all();
   return (Array.isArray(results) ? results : []).map((row) => ({
     id: row.id,
     name: row.name,
+    alias: row.alias || "",
     url: row.url,
     origin_host: row.origin_host,
     subtitle: row.subtitle,
@@ -148,6 +164,118 @@ async function engines(env) {
     online: row.online === 1 || row.online === true,
     version: row.online === 1 || row.online === true ? row.version || "" : ""
   }));
+}
+
+/// One row, with its lease evaluated, or null when the registry has no such id.
+async function registryRow(env, id) {
+  const row = await env.DB.prepare(
+    "SELECT id, name, alias, " +
+      `(heartbeat_at > 0 AND unixepoch() - heartbeat_at <= ${LEASE_SECONDS}) AS online ` +
+      "FROM engines WHERE id = ?1"
+  )
+    .bind(id)
+    .first();
+  if (!row) return null;
+  return { id: row.id, name: row.name, alias: row.alias || "", online: row.online === 1 || row.online === true };
+}
+
+/// Who is asking. A destructive write is not something to leave to an unknown
+/// bearer: the same table the auth Worker issues from decides it, and a store
+/// that cannot be read refuses rather than admitting everybody.
+async function whoIsAsking(request, env) {
+  const claimed = bearer(request);
+  if (!claimed) return { ok: false, response: json(401, { error: "a signed-in session is required", code: "NO_TOKEN" }) };
+  const verdict = await bearerVerdict(env, claimed);
+  if (verdict === "unavailable") return { ok: false, response: error(503, "The token store is unavailable") };
+  if (verdict === "no") return { ok: false, response: json(401, { error: "unauthorized", code: "UNKNOWN_TOKEN" }) };
+  return { ok: true };
+}
+
+/// Forgets an engine that is not running any more.
+///
+/// A live engine is refused, and not out of caution: it writes its own row every
+/// twenty seconds, so deleting a beating row would be undone within one beat and
+/// the caller would be told it had worked. A row with no fresh lease belongs to a
+/// machine that is gone, and that is the row this exists to clear.
+async function deleteEngine(request, env, id) {
+  const who = await whoIsAsking(request, env);
+  if (!who.ok) return who.response;
+  let row;
+  try {
+    row = await registryRow(env, id);
+  } catch {
+    return error(503, "The engine registry is unavailable");
+  }
+  if (!row) return error(404, `no engine named ${id}`);
+  if (row.online) {
+    return json(409, {
+      error: `${row.alias || row.name} is still beating: stop the engine, or wait for its lease to lapse`,
+      code: "ENGINE_ONLINE"
+    });
+  }
+  // The delete repeats the lease test rather than trusting the read above it: a
+  // beat can land in the milliseconds between the two, and a caller told
+  // "deleted" about an engine that is running would be told something untrue.
+  let changed = 0;
+  try {
+    const result = await env.DB.prepare(
+      `DELETE FROM engines WHERE id = ?1 AND (heartbeat_at = 0 OR unixepoch() - heartbeat_at > ${LEASE_SECONDS})`
+    )
+      .bind(id)
+      .run();
+    changed = result?.meta?.changes || 0;
+  } catch {
+    return error(503, "The engine registry is unavailable");
+  }
+  if (!changed) {
+    return json(409, {
+      error: `${row.alias || row.name} started beating again: stop the engine before deleting it`,
+      code: "ENGINE_ONLINE"
+    });
+  }
+  routeCaches.delete(env.DB);
+  return json(200, { ok: true, deleted: id, name: row.name });
+}
+
+/// A name to show, with nothing that a card cannot draw.
+function cleanAlias(raw) {
+  return String(raw ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, ALIAS_MAX);
+}
+
+/// Sets the name a person sees. The id is not touched: it is the path every
+/// client already uses, and renaming must not move a machine's address.
+async function renameEngine(request, env, id) {
+  const who = await whoIsAsking(request, env);
+  if (!who.ok) return who.response;
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return error(400, 'a JSON body with an "alias" field is required');
+  }
+  if (!body || typeof body !== "object" || !("alias" in body)) {
+    return error(400, 'the body has no "alias" field');
+  }
+  const alias = cleanAlias(body.alias);
+  let row;
+  try {
+    row = await registryRow(env, id);
+  } catch {
+    return error(503, "The engine registry is unavailable");
+  }
+  if (!row) return error(404, `no engine named ${id}`);
+  try {
+    await env.DB.prepare("UPDATE engines SET alias = ?1, updated_at = unixepoch() WHERE id = ?2")
+      .bind(alias, id)
+      .run();
+  } catch {
+    return error(503, "The engine registry is unavailable");
+  }
+  routeCaches.delete(env.DB);
+  return json(200, { ok: true, id, alias, name: row.name });
 }
 
 const routeCaches = new WeakMap();
@@ -226,11 +354,21 @@ export default {
     }
 
     // A preflight is about this hostname, not about an engine: answer it here
-    // so the real request can be forwarded on its own terms.
+    // so the real request can be forwarded on its own terms. It is asked before
+    // the registry's own verbs, because a browser checks PATCH and DELETE too.
     if (request.method === "OPTIONS") {
       const origin = allowedOrigin(request, env);
       if (!origin) return error(403, "This origin is not allowed to call the gateway");
       return preflight(request, origin);
+    }
+
+    // One row of the registry, by id: the two writes a person makes about a
+    // machine rather than the machine making about itself.
+    if (segments.length === 3 && first === "api" && segments[1] === "engines") {
+      const id = segments[2];
+      if (request.method === "DELETE") return deleteEngine(request, env, id);
+      if (request.method === "PATCH") return renameEngine(request, env, id);
+      return error(405, `cannot ${request.method} one engine: use PATCH or DELETE`);
     }
 
     // A bearer is a claim, not a credential until the auth Worker vouches for

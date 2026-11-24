@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS engines (
   origin_host TEXT,                      -- <machine>.aixodia.dpdns.org, the tunnel origin
   subtitle    TEXT,
   tag         TEXT,
+  -- The name a person gave this machine, drawn in the app instead of the id.
+  -- Written only by the gateway: the engine never sets it, so a heartbeat cannot
+  -- overwrite it, and the id it addresses the machine by never moves.
+  alias       TEXT NOT NULL DEFAULT '',
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   -- A lease the engine keeps: it writes this every twenty seconds, and a row

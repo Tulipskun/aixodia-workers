@@ -1,0 +1,14 @@
+-- The name a person gave an engine, kept separate from the name it gave itself.
+--
+-- `id` is the machine's own: it is the path segment every client, socket ticket
+-- and revocation already addresses, and the engine writes it from its machine id
+-- on every start. Renaming a machine may therefore never touch it. `alias` is the
+-- one column the engine never writes — the gateway owns it — so a heartbeat
+-- cannot overwrite the name a person chose.
+--
+-- An empty alias is not an error: it means nobody has named this machine yet, and
+-- the registry's `name` (the id) is what is shown.
+--
+-- Applied once, by hand:
+--   npx wrangler d1 execute aixodia --remote --file=migrations/004_engine_alias.sql
+ALTER TABLE engines ADD COLUMN alias TEXT NOT NULL DEFAULT '';
