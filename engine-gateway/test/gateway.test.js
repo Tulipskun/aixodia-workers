@@ -88,9 +88,12 @@ function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
             return {
               async run() {
                 const at = list.findIndex((r) => r.id === id);
-                const fresh = at >= 0 && list[at].heartbeat_at > 0 &&
-                  Math.floor(Date.now() / 1000) - list[at].heartbeat_at <= 60;
-                if (at < 0 || fresh) return { meta: { changes: 0 } };
+                // The same rule the SQL states: the row may go only when the
+                // machine has been silent long enough for its address to come
+                // down with it.
+                const beat = at >= 0 ? Number(list[at].heartbeat_at || 0) : 0;
+                const gone = beat === 0 || Math.floor(Date.now() / 1000) - beat >= 24 * 3600;
+                if (at < 0 || !gone) return { meta: { changes: 0 } };
                 list.splice(at, 1);
                 return { meta: { changes: 1 } };
               }
@@ -122,7 +125,13 @@ function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
                 const row = list.find((r) => r.id === id);
                 if (!row) return null;
                 const fresh = row.heartbeat_at > 0 && Math.floor(Date.now() / 1000) - row.heartbeat_at <= 60;
-                return { id: row.id, name: row.name, alias: row.alias || "", online: fresh ? 1 : 0 };
+                return {
+                  id: row.id,
+                  name: row.name,
+                  alias: row.alias || "",
+                  heartbeat_at: row.heartbeat_at,
+                  online: fresh ? 1 : 0
+                };
               }
             };
           }
@@ -146,13 +155,36 @@ function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
 
 const env = {
   ACCESS_CLIENT_ID: "id.access",
-  ACCESS_CLIENT_SECRET: "secret"
+  ACCESS_CLIENT_SECRET: "secret",
+  CF_ACCOUNT_ID: "acct-1",
+  CF_ZONE_ID: "zone-1",
+  CF_ADMIN_TOKEN: "admin-token"
 };
+
+/// A Cloudflare account with one tunnel, one DNS record and no surprises.
+function cloudflare({ records = [{ id: "rec-1", name: "work-1.aixodia.dpdns.org" }], tunnels = [{ id: "tun-1", name: "work-1" }], refuse = {} } = {}) {
+  const asked = [];
+  const answer = (url, init = {}) => {
+    const path = url.pathname.replace("/client/v4", "");
+    asked.push([init.method || "GET", path]);
+    const refuseAt = Object.keys(refuse).find((step) => path.includes(step));
+    if (refuseAt) {
+      return new Response(JSON.stringify({ success: false, errors: [{ message: refuse[refuseAt] }] }), {
+        status: 403
+      });
+    }
+    let result = [];
+    if (path.includes("/dns_records")) result = records;
+    if (path.includes("/cfd_tunnel")) result = tunnels;
+    return new Response(JSON.stringify({ success: true, result }), { status: 200 });
+  };
+  return { asked, answer };
+}
 
 const registryRequest = () => new Request("https://engine.aixodia.dpdns.org/api/engines");
 
 /// Runs the Worker with a fake network, and reports what it did.
-async function run(request, { db = registry(rows), answer } = {}) {
+async function run(request, { db = registry(rows), answer, config } = {}) {
   const calls = [];
   const original = globalThis.fetch;
   globalThis.fetch = async (target, init = {}) => {
@@ -161,9 +193,16 @@ async function run(request, { db = registry(rows), answer } = {}) {
     if (answer) return answer(url, init);
     return new Response("ok", { status: 200 });
   };
+  const deletes = [];
+  const kv = config || {
+    deleted: deletes,
+    async delete(key) {
+      deletes.push(key);
+    }
+  };
   try {
-    const response = await worker.fetch(request, { DB: db, ...env });
-    return { response, calls, db };
+    const response = await worker.fetch(request, { DB: db, CONFIG: kv, ...env });
+    return { response, calls, db, kv };
   } finally {
     globalThis.fetch = original;
   }
@@ -459,12 +498,81 @@ const renameHandle = (body, id = "work-1") =>
     body: typeof body === "string" ? body : JSON.stringify(body)
   });
 
-test("an engine that stopped beating is deleted, and nothing is forwarded", async () => {
-  const db = data({ tokens: await activeTokens() });
-  const { response, calls } = await run(rowHandle(), { db });
+test("an engine that has been gone a day is deleted with its address", async () => {
+  const db = data({
+    source: [rows[0], { ...rows[1], heartbeat_at: now() - 25 * 3600 }],
+    tokens: await activeTokens()
+  });
+  const cf = cloudflare();
+  const { response, calls, kv } = await run(rowHandle(), { db, answer: cf.answer });
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, deleted: "work-1", name: "Work" });
-  assert.equal(calls.length, 0, "a delete is a registry write, not a forward");
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    deleted: "work-1",
+    name: "Work",
+    url_removed: true,
+    steps: { dns: "removed 1", tunnel: "removed 1", keys: "removed 3" }
+  });
+  // Nothing was forwarded: a delete is a registry write and an address teardown.
+  assert.deepEqual(
+    calls.map((c) => c.url.host),
+    ["api.cloudflare.com", "api.cloudflare.com", "api.cloudflare.com", "api.cloudflare.com"]
+  );
+  // DNS first, then the tunnel: the hostname must stop resolving before the
+  // thing it names disappears, never the other way round.
+  assert.deepEqual(cf.asked, [
+    ["GET", "/zones/zone-1/dns_records"],
+    ["DELETE", "/zones/zone-1/dns_records/rec-1"],
+    ["GET", "/accounts/acct-1/cfd_tunnel"],
+    ["DELETE", "/accounts/acct-1/cfd_tunnel/tun-1"]
+  ]);
+  // And the keys that would let the next start reuse a tunnel that is gone.
+  assert.deepEqual(kv.deleted, [
+    "instances/work-1/tunnel_token",
+    "instances/work-1/tunnel_url",
+    "instances/work-1/daemon/url"
+  ]);
+});
+
+test("an engine that went quiet ten minutes ago keeps its address", async () => {
+  const db = data({ tokens: await activeTokens() });
+  const cf = cloudflare();
+  const { response, calls } = await run(rowHandle(), { db, answer: cf.answer });
+  assert.equal(response.status, 409);
+  const body = await response.json();
+  assert.equal(body.code, "ENGINE_TOO_RECENT");
+  assert.match(body.error, /last seen 10 min/);
+  // A sleeping machine is not a gone machine: nothing was torn down and the row
+  // is still there.
+  assert.equal(calls.length, 0);
+  assert.equal(await (await run(registryRequest(), { db })).response.json().then((b) => b.engines.length), 2);
+});
+
+test("a machine that stopped beating long ago but is still up is deleted whole", async () => {
+  const db = data({
+    source: [{ ...rows[1], heartbeat_at: 0 }],
+    tokens: await activeTokens()
+  });
+  const cf = cloudflare({ records: [], tunnels: [] });
+  const { response } = await run(rowHandle(), { db, answer: cf.answer });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body.steps, { dns: "none", tunnel: "none", keys: "removed 3" });
+  assert.equal(body.url_removed, true, "nothing left standing is a clean delete");
+});
+
+test("a refusal from Cloudflare is reported, not hidden behind an ok", async () => {
+  const db = data({
+    source: [{ ...rows[1], heartbeat_at: now() - 25 * 3600 }],
+    tokens: await activeTokens()
+  });
+  const cf = cloudflare({ refuse: { cfd_tunnel: "tunnel is in use" } });
+  const { response } = await run(rowHandle(), { db, answer: cf.answer });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.url_removed, false);
+  assert.match(body.steps.tunnel, /^failed: tunnel is in use$/);
+  assert.equal(body.steps.dns, "removed 1", "the steps that did run are still said");
 });
 
 test("a live engine is refused, because its own heartbeat would undo the delete", async () => {

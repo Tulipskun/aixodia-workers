@@ -59,6 +59,20 @@ const ALIAS_MAX = 40;
 /// not a death, two in a row is.
 const LEASE_SECONDS = 60;
 
+/// How long an engine must have been silent before its address is taken down.
+///
+/// Deleting the row alone is cheap and reversible — the machine writes it again
+/// the next time it starts — but a tunnel and a DNS record are the machine's
+/// public address, and tearing them down for a machine that is merely asleep
+/// would leave it unreachable until it next starts. So a delete means a whole
+/// delete, and a whole delete waits for a silence no short outage produces.
+const GONE_SECONDS = 24 * 60 * 60;
+
+/// The keys a machine writes about itself on first start. Deleting them makes
+/// the next start provision a fresh tunnel, which is how a rebuilt machine gets
+/// its address back.
+const MACHINE_KEYS = ["tunnel_token", "tunnel_url", "daemon/url"];
+
 /// How long this isolate may reuse the rows it forwards to. Engines are added
 /// and renamed by hand, so a few seconds of staleness costs nothing.
 const ROUTE_CACHE_MS = 10_000;
@@ -179,6 +193,39 @@ async function registryRow(env, id) {
   return { id: row.id, name: row.name, alias: row.alias || "", online: row.online === 1 || row.online === true };
 }
 
+/// One row, with its lease evaluated and how long it has been silent, or null
+/// when the registry has no such id.
+async function beatRow(env, id) {
+  const row = await env.DB.prepare(
+    "SELECT id, name, alias, heartbeat_at, " +
+      `(heartbeat_at > 0 AND unixepoch() - heartbeat_at <= ${LEASE_SECONDS}) AS online ` +
+      "FROM engines WHERE id = ?1"
+  )
+    .bind(id)
+    .first();
+  if (!row) return null;
+  const beat = Number(row.heartbeat_at || 0);
+  // A row that never beat has no age at all: it was written and nothing has
+  // claimed it since, which is the most silent a machine can be.
+  const age = beat > 0 ? Math.max(0, Math.floor(Date.now() / 1000) - beat) : Number.MAX_SAFE_INTEGER;
+  return {
+    id: row.id,
+    name: row.name,
+    alias: row.alias || "",
+    online: row.online === 1 || row.online === true,
+    age
+  };
+}
+
+/// A duration in words a person can act on.
+function ago(seconds) {
+  if (!Number.isFinite(seconds)) return "never";
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 90 * 60) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 48 * 3600) return `${Math.round(seconds / 3600)} h`;
+  return `${Math.round(seconds / 86400)} days`;
+}
+
 /// Who is asking. A destructive write is not something to leave to an unknown
 /// bearer: the same table the auth Worker issues from decides it, and a store
 /// that cannot be read refuses rather than admitting everybody.
@@ -202,15 +249,30 @@ async function deleteEngine(request, env, id) {
   if (!who.ok) return who.response;
   let row;
   try {
-    row = await registryRow(env, id);
+    row = await beatRow(env, id);
   } catch {
     return error(503, "The engine registry is unavailable");
   }
   if (!row) return error(404, `no engine named ${id}`);
+  const name = row.alias || row.name;
   if (row.online) {
     return json(409, {
-      error: `${row.alias || row.name} is still beating: stop the engine, or wait for its lease to lapse`,
+      error: `${name} is still beating: stop the engine, or wait for its lease to lapse`,
       code: "ENGINE_ONLINE"
+    });
+  }
+  // A machine that stopped beating minutes ago is asleep, not gone, and its
+  // address is still the one it will want when it wakes. Refusing here is what
+  // makes "delete" mean the same thing every time: the row, the hostname, the
+  // tunnel and the keys, or nothing at all.
+  const silent = row.age;
+  if (silent < GONE_SECONDS) {
+    return json(409, {
+      error: `${name} was last seen ${ago(silent)}, so its address is kept: ` +
+        `an engine may be deleted once it has been silent for ${ago(GONE_SECONDS)}`,
+      code: "ENGINE_TOO_RECENT",
+      silent_seconds: silent,
+      wait_seconds: GONE_SECONDS - silent
     });
   }
   // The delete repeats the lease test rather than trusting the read above it: a
@@ -219,7 +281,7 @@ async function deleteEngine(request, env, id) {
   let changed = 0;
   try {
     const result = await env.DB.prepare(
-      `DELETE FROM engines WHERE id = ?1 AND (heartbeat_at = 0 OR unixepoch() - heartbeat_at > ${LEASE_SECONDS})`
+      `DELETE FROM engines WHERE id = ?1 AND (heartbeat_at = 0 OR unixepoch() - heartbeat_at >= ${GONE_SECONDS})`
     )
       .bind(id)
       .run();
@@ -229,12 +291,95 @@ async function deleteEngine(request, env, id) {
   }
   if (!changed) {
     return json(409, {
-      error: `${row.alias || row.name} started beating again: stop the engine before deleting it`,
+      error: `${name} started beating again: stop the engine before deleting it`,
       code: "ENGINE_ONLINE"
     });
   }
+  // The row is gone, so the address is unpublishable from here on: nothing left
+  // names it. So it is taken down now, and every step is reported.
+  const steps = await unpublish(env, id);
   routeCaches.delete(env.DB);
-  return json(200, { ok: true, deleted: id, name: row.name });
+  const clean = Object.values(steps).every((step) => !String(step).startsWith("failed"));
+  return json(200, { ok: true, deleted: id, name: row.name, url_removed: clean, steps });
+}
+
+/// One Cloudflare API call, with the account token this Worker is given.
+///
+/// The token is a secret binding, never a variable: it can delete tunnels and
+/// DNS records for the whole account, so it must not be readable from the
+/// repository or from `/api/…` answers.
+async function cloudflare(env, path, init) {
+  if (!env.CF_ADMIN_TOKEN) throw new Error("CF_ADMIN_TOKEN is not configured");
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${env.CF_ADMIN_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(init?.headers || {})
+    }
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.success === false) {
+    const why = (body.errors || []).map((e) => e.message).filter(Boolean).join("; ");
+    throw new Error(why || `HTTP ${response.status}`);
+  }
+  return body.result;
+}
+
+/// Takes down everything a machine published about itself.
+///
+/// The order is the one that leaves no half-address behind: the DNS record goes
+/// first so nothing resolves to a tunnel that is about to vanish, then the
+/// tunnel (which is what its token was for), then the keys that would otherwise
+/// let the next start reuse a tunnel that no longer exists.
+///
+/// A step that fails does not stop the others: the registry row is deleted
+/// either way, so the caller must be told exactly which parts of the address
+/// are still standing rather than a single "ok".
+async function unpublish(env, id) {
+  const account = env.CF_ACCOUNT_ID;
+  const zone = env.CF_ZONE_ID;
+  const domain = env.CF_DOMAIN || "aixodia.dpdns.org";
+  const host = `${id}.${domain}`;
+  const steps = {};
+
+  // 1. The hostname clients use.
+  try {
+    const records = await cloudflare(env, `/zones/${zone}/dns_records?name=${encodeURIComponent(host)}`);
+    const mine = (records || []).filter((r) => r.name === host);
+    for (const record of mine) {
+      await cloudflare(env, `/zones/${zone}/dns_records/${record.id}`, { method: "DELETE" });
+    }
+    steps.dns = mine.length ? `removed ${mine.length}` : "none";
+  } catch (e) {
+    steps.dns = `failed: ${e.message}`;
+  }
+
+  // 2. The tunnel the hostname pointed at, found by the machine's own name.
+  try {
+    const tunnels = await cloudflare(
+      env,
+      `/accounts/${account}/cfd_tunnel?name=${encodeURIComponent(id)}&is_deleted=false`
+    );
+    const mine = (tunnels || []).filter((t) => t.name === id);
+    for (const tunnel of mine) {
+      await cloudflare(env, `/accounts/${account}/cfd_tunnel/${tunnel.id}`, { method: "DELETE" });
+    }
+    steps.tunnel = mine.length ? `removed ${mine.length}` : "none";
+  } catch (e) {
+    steps.tunnel = `failed: ${e.message}`;
+  }
+
+  // 3. What the machine remembers about its address.
+  try {
+    if (!env.CONFIG) throw new Error("the KV binding is not configured");
+    for (const key of MACHINE_KEYS) await env.CONFIG.delete(`instances/${id}/${key}`);
+    steps.keys = `removed ${MACHINE_KEYS.length}`;
+  } catch (e) {
+    steps.keys = `failed: ${e.message}`;
+  }
+
+  return steps;
 }
 
 /// A name to show, with nothing that a card cannot draw.
