@@ -61,7 +61,7 @@ async function hashToken(token) {
 
 /// A D1 stand-in that answers both the registry and the token table, so a test
 /// can decide which bearer the gateway vouches for.
-function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
+function data({ source = rows, tokens = [], tokenQueryFails = false, racingBeat = false } = {}) {
   const list = source.map((row) => ({ ...row }));
   const queries = [];
   return {
@@ -88,12 +88,14 @@ function data({ source = rows, tokens = [], tokenQueryFails = false } = {}) {
             return {
               async run() {
                 const at = list.findIndex((r) => r.id === id);
-                // The same rule the SQL states: the row may go only when the
-                // machine has been silent long enough for its address to come
-                // down with it.
+                // The same rule the SQL states: a beating row may not go, a
+                // row that is not beating may.
                 const beat = at >= 0 ? Number(list[at].heartbeat_at || 0) : 0;
-                const gone = beat === 0 || Math.floor(Date.now() / 1000) - beat >= 24 * 3600;
-                if (at < 0 || !gone) return { meta: { changes: 0 } };
+                const gone = beat === 0 || Math.floor(Date.now() / 1000) - beat > 60;
+                // `racingBeat` is a beat that lands between the read and the
+                // write: the row is read as stale and is fresh by the time the
+                // delete reaches it.
+                if (at < 0 || !gone || racingBeat) return { meta: { changes: 0 } };
                 list.splice(at, 1);
                 return { meta: { changes: 1 } };
               }
@@ -534,18 +536,28 @@ test("an engine that has been gone a day is deleted with its address", async () 
   ]);
 });
 
-test("an engine that went quiet ten minutes ago keeps its address", async () => {
+test("an engine that went quiet ten minutes ago is deleted now, with its address", async () => {
+  // Offline is the whole test. A machine that stopped beating owns nothing in
+  // this registry any more, and its address is not held for it: asking a person
+  // to wait a day for a machine they can see is off was a rule about nothing.
   const db = data({ tokens: await activeTokens() });
   const cf = cloudflare();
-  const { response, calls } = await run(rowHandle(), { db, answer: cf.answer });
-  assert.equal(response.status, 409);
+  const { response, kv } = await run(rowHandle(), { db, answer: cf.answer });
+  assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.code, "ENGINE_TOO_RECENT");
-  assert.match(body.error, /last seen 10 min/);
-  // A sleeping machine is not a gone machine: nothing was torn down and the row
-  // is still there.
-  assert.equal(calls.length, 0);
-  assert.equal(await (await run(registryRequest(), { db })).response.json().then((b) => b.engines.length), 2);
+  assert.equal(body.deleted, "work-1");
+  assert.equal(body.url_removed, true);
+  assert.deepEqual(body.steps, { dns: "removed 1", tunnel: "removed 1", keys: "removed 3" });
+  assert.equal(kv.deleted.length, 3);
+});
+
+test("an engine that starts beating again between the read and the delete is refused", async () => {
+  // The lease test is repeated inside the DELETE itself, so a beat that lands
+  // after the read cannot be overwritten: the caller is refused, not lied to.
+  const db = data({ tokens: await activeTokens(), racingBeat: true });
+  const { response } = await run(rowHandle(), { db, answer: cloudflare().answer });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "ENGINE_ONLINE");
 });
 
 test("a machine that stopped beating long ago but is still up is deleted whole", async () => {
