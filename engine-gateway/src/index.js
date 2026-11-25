@@ -171,6 +171,41 @@ async function engines(env) {
   }));
 }
 
+/// The devices the Droidime section draws, in the order they were added.
+///
+/// A device is not an engine: it has no daemon to ask for readings, so the only
+/// thing the registry can honestly say about it is whether it has been in touch.
+/// `battery` is null when nothing has told us, which the card draws as an em
+/// dash rather than as a number it made up.
+async function devices(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, name, alias, origin_host, subtitle, battery, " +
+      `(heartbeat_at > 0 AND unixepoch() - heartbeat_at <= ${LEASE_SECONDS}) AS online ` +
+      "FROM devices ORDER BY created_at, id"
+  ).all();
+  return (Array.isArray(results) ? results : []).map((row) => ({
+    id: row.id,
+    name: row.name,
+    alias: row.alias || "",
+    origin_host: row.origin_host,
+    subtitle: row.subtitle || "",
+    battery: typeof row.battery === "number" ? row.battery : null,
+    online: row.online === 1 || row.online === true
+  }));
+}
+
+/// One device by id, or null. Used by the health probe, which is the only thing
+/// the phone asks a device directly: whether it is answering.
+async function deviceRow(env, id) {
+  const row = await env.DB.prepare(
+    "SELECT id, name, origin_host FROM devices WHERE id = ?1"
+  )
+    .bind(id)
+    .first();
+  if (!row) return null;
+  return { id: row.id, name: row.name, origin_host: row.origin_host || "" };
+}
+
 /// One row, with its lease evaluated, or null when the registry has no such id.
 async function registryRow(env, id) {
   const row = await env.DB.prepare(
@@ -464,6 +499,61 @@ export default {
       if (request.method === "DELETE") return deleteEngine(request, env, id);
       if (request.method === "PATCH") return renameEngine(request, env, id);
       return error(405, `cannot ${request.method} one engine: use PATCH or DELETE`);
+    }
+
+    // The devices the Droidime section draws. A separate list, because a device
+    // is not an engine: it has no shells, no desktop and no readings of its own.
+    if (
+      (segments.length === 1 && first === "devices") ||
+      (segments.length === 2 && first === "api" && segments[1] === "devices")
+    ) {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return error(405, "The device list is read-only");
+      }
+      try {
+        return json(200, { devices: await devices(env) });
+      } catch {
+        return error(503, "The device list is unavailable");
+      }
+    }
+
+    // The one question the phone asks a device itself: is it answering? Proxied
+    // so the answer comes through this hostname, with the Access service token
+    // attached here rather than shipped in the app.
+    if (segments.length === 4 && first === "api" && segments[1] === "devices" && segments[3] === "healthz") {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return error(405, "A device's health is a read");
+      }
+      let device;
+      try {
+        device = await deviceRow(env, segments[2]);
+      } catch {
+        return error(503, "The device list is unavailable");
+      }
+      if (!device) return error(404, `no device named ${segments[2]}`);
+      if (!device.origin_host) return error(502, `device ${device.id} has no origin`);
+      const target = new URL(request.url);
+      target.protocol = "https:";
+      target.host = device.origin_host;
+      target.pathname = "/healthz";
+      const headers = new Headers(request.headers);
+      headers.delete("host");
+      headers.delete("origin");
+      headers.delete("referer");
+      for (const [name, value] of Object.entries(tokenHeaders(env))) headers.set(name, value);
+      // The device's own answer, unread: what its `/healthz` says is not ours to
+      // interpret here, only to pass on. A device that does not answer is a 502,
+      // which is the same "not there" the phone already understands.
+      try {
+        const answer = await fetch(target.toString(), { method: request.method, headers });
+        return new Response(answer.body, {
+          status: answer.status,
+          statusText: answer.statusText,
+          headers: answer.headers
+        });
+      } catch {
+        return error(502, `device ${device.id} did not answer`);
+      }
     }
 
     // A bearer is a claim, not a credential until the auth Worker vouches for

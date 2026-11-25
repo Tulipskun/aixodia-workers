@@ -61,8 +61,9 @@ async function hashToken(token) {
 
 /// A D1 stand-in that answers both the registry and the token table, so a test
 /// can decide which bearer the gateway vouches for.
-function data({ source = rows, tokens = [], tokenQueryFails = false, racingBeat = false } = {}) {
+function data({ source = rows, tokens = [], tokenQueryFails = false, racingBeat = false, deviceList = [] } = {}) {
   const list = source.map((row) => ({ ...row }));
+  const devices = deviceList.map((row) => ({ ...row }));
   const queries = [];
   return {
     queries,
@@ -135,6 +136,32 @@ function data({ source = rows, tokens = [], tokenQueryFails = false, racingBeat 
                   online: fresh ? 1 : 0
                 };
               }
+            };
+          }
+        };
+      }
+      if (/FROM devices WHERE id/i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(id) {
+            return {
+              async first() {
+                const row = devices.find((r) => r.id === id);
+                return row ? { id: row.id, name: row.name, origin_host: row.origin_host } : null;
+              }
+            };
+          }
+        };
+      }
+      if (/FROM devices ORDER BY/i.test(sql)) {
+        queries.push(sql);
+        return {
+          async all() {
+            return {
+              results: devices.map((row) => ({
+                ...row,
+                online: row.heartbeat_at > 0 && Math.floor(Date.now() / 1000) - row.heartbeat_at <= 60 ? 1 : 0
+              }))
             };
           }
         };
@@ -691,4 +718,79 @@ test("one engine row answers nothing but its two writes", async () => {
     { db: data({ tokens: await activeTokens() }) }
   );
   assert.equal(response.status, 405);
+});
+
+const devices = [
+  {
+    id: "droidime-neo-3t",
+    name: "droidime-neo-3t",
+    alias: "neo 3T",
+    origin_host: "neo-3t.aixodia.dpdns.org",
+    subtitle: "neo 3T · realme",
+    battery: null,
+    heartbeat_at: 0
+  },
+  {
+    id: "droidime-i2405",
+    name: "droidime-i2405",
+    alias: "",
+    origin_host: "i2405-c2db81.aixodia.dpdns.org",
+    subtitle: "i2405 · vivo",
+    battery: 62,
+    heartbeat_at: now()
+  }
+];
+
+test("the devices are a list of their own, not engines with a tag", async () => {
+  // The two lists come from two tables: a device has no daemon, no shells and no
+  // desktop, and cannot be reached by an engine's card by accident.
+  const db = data({ deviceList: devices });
+  const { response, calls } = await run(new Request("https://engine.aixodia.dpdns.org/api/devices"), { db });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 0, "the list is a read, not a probe");
+  const body = await response.json();
+  assert.deepEqual(
+    body.devices.map((d) => [d.id, d.alias, d.online, d.battery]),
+    [
+      ["droidime-neo-3t", "neo 3T", false, null],
+      ["droidime-i2405", "", true, 62]
+    ]
+  );
+
+  const engines = await run(registryRequest(), { db });
+  const listed = (await engines.response.json()).engines.map((e) => e.id);
+  assert.ok(!listed.includes("droidime-neo-3t"), "a device is not in the engine list");
+});
+
+test("a device's health is asked through this hostname, with the token attached here", async () => {
+  const db = data({ deviceList: devices });
+  const { response, calls } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/devices/droidime-neo-3t/healthz"),
+    { db }
+  );
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url.href, "https://neo-3t.aixodia.dpdns.org/healthz");
+  assert.equal(calls[0].init.headers.get("cf-access-client-id"), "id.access");
+  assert.equal(calls[0].init.headers.get("cf-access-client-secret"), "secret");
+});
+
+test("an unknown device is a 404, and a silent one is a 502", async () => {
+  const db = data({ deviceList: devices });
+  const unknown = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/devices/nope/healthz"),
+    { db }
+  );
+  assert.equal(unknown.response.status, 404);
+
+  const dead = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/devices/droidime-i2405/healthz"),
+    {
+      db,
+      answer: () => {
+        throw new Error("no route to host");
+      }
+    }
+  );
+  assert.equal(dead.response.status, 502);
 });
