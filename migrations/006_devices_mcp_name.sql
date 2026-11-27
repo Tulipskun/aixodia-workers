@@ -1,0 +1,11 @@
+-- The name a DroidIME device answers to.
+--
+-- Its MCP endpoint serves exactly one path — the device name the app was given —
+-- and answers everything else with a JSON-RPC `-32601`. That is the only
+-- question the phone can answer about itself, so the gateway has to know the
+-- path before it can ask; `/healthz` never existed on that server.
+--
+-- The rows already in the table predate this column, so an empty value means
+-- "this registry does not know where to ask yet" and the health route says so
+-- rather than reporting a live phone as a dead one.
+ALTER TABLE devices ADD COLUMN mcp_name TEXT NOT NULL DEFAULT '';

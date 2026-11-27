@@ -198,13 +198,34 @@ async function devices(env) {
 /// the phone asks a device directly: whether it is answering.
 async function deviceRow(env, id) {
   const row = await env.DB.prepare(
-    "SELECT id, name, origin_host FROM devices WHERE id = ?1"
+    "SELECT id, name, origin_host, mcp_name FROM devices WHERE id = ?1"
   )
     .bind(id)
     .first();
   if (!row) return null;
-  return { id: row.id, name: row.name, origin_host: row.origin_host || "" };
+  return {
+    id: row.id,
+    name: row.name,
+    origin_host: row.origin_host || "",
+    mcp_name: row.mcp_name || ""
+  };
 }
+
+/// What a DroidIME device answers to. Its MCP endpoint serves one path — its own
+/// device name — and every other path is a JSON-RPC `-32601`, so `/healthz` was
+/// a question the phone never had an answer for: four devices sat offline in the
+/// app while each one was up and driving its screen.
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+const MCP_INITIALIZE = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "aixodia-gateway", version: "1" }
+  }
+});
 
 /// One row, with its lease evaluated, or null when the registry has no such id.
 async function registryRow(env, id) {
@@ -532,28 +553,44 @@ export default {
       }
       if (!device) return error(404, `no device named ${segments[2]}`);
       if (!device.origin_host) return error(502, `device ${device.id} has no origin`);
+      if (!device.mcp_name) return error(502, `device ${device.id} has no MCP name`);
+      // The question the phone can answer: an MCP handshake at its own name.
       const target = new URL(request.url);
       target.protocol = "https:";
       target.host = device.origin_host;
-      target.pathname = "/healthz";
-      const headers = new Headers(request.headers);
-      headers.delete("host");
-      headers.delete("origin");
-      headers.delete("referer");
+      target.pathname = "/" + device.mcp_name;
+      const headers = new Headers();
+      headers.set("content-type", "application/json");
+      headers.set("accept", "application/json, text/event-stream");
+      headers.set("mcp-protocol-version", MCP_PROTOCOL_VERSION);
       for (const [name, value] of Object.entries(tokenHeaders(env))) headers.set(name, value);
-      // The device's own answer, unread: what its `/healthz` says is not ours to
-      // interpret here, only to pass on. A device that does not answer is a 502,
-      // which is the same "not there" the phone already understands.
+      let answer;
       try {
-        const answer = await fetch(target.toString(), { method: request.method, headers });
-        return new Response(answer.body, {
-          status: answer.status,
-          statusText: answer.statusText,
-          headers: answer.headers
+        answer = await fetch(target.toString(), {
+          method: "POST",
+          headers,
+          body: MCP_INITIALIZE
         });
       } catch {
         return error(502, `device ${device.id} did not answer`);
       }
+      // A device's own liveness is its own answer. Nothing else writes
+      // `devices.heartbeat_at`, so before this the list's lease could never be
+      // satisfied and every phone read as offline however alive it was.
+      if (!answer.ok) {
+        return error(502, `device ${device.id} answered ${answer.status}`);
+      }
+      try {
+        await env.DB.prepare(
+          "UPDATE devices SET heartbeat_at = unixepoch() WHERE id = ?1"
+        )
+          .bind(device.id)
+          .run();
+      } catch {
+        // The beat is a nicety next to the answer that just arrived: a registry
+        // that cannot be written must not turn a live phone into a dead one.
+      }
+      return json(200, { id: device.id, online: true });
     }
 
     // A bearer is a claim, not a credential until the auth Worker vouches for

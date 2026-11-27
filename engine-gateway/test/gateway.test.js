@@ -147,7 +147,23 @@ function data({ source = rows, tokens = [], tokenQueryFails = false, racingBeat 
             return {
               async first() {
                 const row = devices.find((r) => r.id === id);
-                return row ? { id: row.id, name: row.name, origin_host: row.origin_host } : null;
+                return row
+                  ? { id: row.id, name: row.name, origin_host: row.origin_host, mcp_name: row.mcp_name || "" }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+      if (/UPDATE devices SET heartbeat_at/i.test(sql)) {
+        queries.push(sql);
+        return {
+          bind(id) {
+            return {
+              async run() {
+                const row = devices.find((r) => r.id === id);
+                if (row) row.heartbeat_at = now();
+                return { meta: { changes: row ? 1 : 0 } };
               }
             };
           }
@@ -728,7 +744,8 @@ const devices = [
     origin_host: "neo-3t.aixodia.dpdns.org",
     subtitle: "neo 3T · realme",
     battery: null,
-    heartbeat_at: 0
+    heartbeat_at: 0,
+    mcp_name: "neo-3t"
   },
   {
     id: "droidime-i2405",
@@ -737,7 +754,8 @@ const devices = [
     origin_host: "i2405-c2db81.aixodia.dpdns.org",
     subtitle: "i2405 · vivo",
     battery: 62,
-    heartbeat_at: now()
+    heartbeat_at: now(),
+    mcp_name: "i2405-c2db81"
   }
 ];
 
@@ -762,7 +780,7 @@ test("the devices are a list of their own, not engines with a tag", async () => 
   assert.ok(!listed.includes("droidime-neo-3t"), "a device is not in the engine list");
 });
 
-test("a device's health is asked through this hostname, with the token attached here", async () => {
+test("a device's health is the MCP handshake it can answer, through this hostname", async () => {
   const db = data({ deviceList: devices });
   const { response, calls } = await run(
     new Request("https://engine.aixodia.dpdns.org/api/devices/droidime-neo-3t/healthz"),
@@ -770,9 +788,40 @@ test("a device's health is asked through this hostname, with the token attached 
   );
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url.href, "https://neo-3t.aixodia.dpdns.org/healthz");
+  // A DroidIME server serves one path — its own device name — and answers
+  // `/healthz` with a JSON-RPC `-32601`, which is why four working phones read as
+  // offline until this asked the question they have an answer for.
+  assert.equal(calls[0].url.href, "https://neo-3t.aixodia.dpdns.org/neo-3t");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.get("mcp-protocol-version"), "2025-06-18");
   assert.equal(calls[0].init.headers.get("cf-access-client-id"), "id.access");
   assert.equal(calls[0].init.headers.get("cf-access-client-secret"), "secret");
+  const asked = JSON.parse(calls[0].init.body);
+  assert.equal(asked.method, "initialize");
+  const body = await response.json();
+  assert.deepEqual(body, { id: "droidime-neo-3t", online: true });
+});
+
+test("an answer is a beat: the device's own yes is what the list's lease counts", async () => {
+  const db = data({ deviceList: devices });
+  const { response, db: used } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/devices/droidime-neo-3t/healthz"),
+    { db }
+  );
+  assert.equal(response.status, 200);
+  const wrote = used.queries.filter((sql) => /UPDATE devices SET heartbeat_at/i.test(sql));
+  assert.equal(wrote.length, 1, "the phone's own answer is written down, and nothing else writes it");
+});
+
+test("a device with no MCP name is not guessed at", async () => {
+  const unnamed = devices.map((d) => ({ ...d, mcp_name: "" }));
+  const db = data({ deviceList: unnamed });
+  const { response, calls } = await run(
+    new Request("https://engine.aixodia.dpdns.org/api/devices/droidime-neo-3t/healthz"),
+    { db }
+  );
+  assert.equal(response.status, 502);
+  assert.equal(calls.length, 0, "an unknown address is said out loud, not dialled");
 });
 
 test("an unknown device is a 404, and a silent one is a 502", async () => {
